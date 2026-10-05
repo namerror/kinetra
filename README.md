@@ -43,6 +43,7 @@ The first physical mission uses three to five viewing locations in a bounded, re
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Planned components, information flow, and model choices |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | Baselines, trial design, and metrics |
 | [docs/SETUP_HANDOFF.md](docs/SETUP_HANDOFF.md) | Ordered starting tasks and unresolved environment questions |
+| [docs/ROBOT_INVENTORY.md](docs/ROBOT_INVENTORY.md) | Confirmed Go2 setup facts, interface leads, and live checks |
 | [docs/HACKATHON.md](docs/HACKATHON.md) | Current hackathon requirements, judging, submission checklist, and public-release boundaries |
 | `src/kinetra/` | Reserved for public, hackathon-specific implementation |
 | `tests/`, `evaluation/`, `demo/` | Reserved for tests, trial artifacts, and demo material |

@@ -4,9 +4,11 @@
 
 This repository is a planning scaffold. There is no working package, environment specification, robot adapter, API client, or test suite yet. Read `PROJECT_SPEC.md`, `ARCHITECTURE.md`, `EVALUATION.md`, and `HACKATHON.md` first.
 
+The team has confirmed ROS 2, Jetson Orin access by SSH, and a front camera. An example from another project suggests RGB-D, odometry, and a TCP velocity receiver, but its topic names and safety behavior still need live verification. See [the robot inventory](ROBOT_INVENTORY.md) before implementing the robot adapter.
+
 ## Ordered first work
 
-1. **Inventory the actual Go2 setup:** model/SDK, onboard and external cameras, depth source, odometry, compute host, ROS version if any, available obstacle avoidance, emergency stop, and what code may be published. Record only releasable interface details here.
+1. **Finish the live Go2 inventory:** verify the camera/depth/odometry topics and frames, command receiver, obstacle stopping, emergency stop, and what code may be published. Record only releasable interface details in [ROBOT_INVENTORY.md](ROBOT_INVENTORY.md).
 2. **Test physical feasibility in a bounded area:** collect robot-height snapshots of a standing dark-clothed distractor and a lying target at multiple distances; measure whether the robot can execute and stop one safe short move. Do not assume a person detector trained on standing pedestrians recognizes a lying person.
 3. **Verify Nebius access:** list models for the team's account, make an actual Nemotron text inference call, test a candidate vision model with one real snapshot, and record latency, output quality, response format, and model identity. Avoid committing credentials or identifiable private images.
 4. **Choose the first technical environment** based on the available Go2 stack. Establish a public mock robot and recorded-scene path before coupling model decisions to hardware.
