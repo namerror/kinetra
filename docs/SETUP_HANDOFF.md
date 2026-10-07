@@ -1,14 +1,40 @@
 # Next-agent setup handoff
 
+## Status
+
+**A live Jetson/Go2 survey was completed on October 7, 2026.** Step 1 below is largely done and its results
+are in [ROBOT_INVENTORY.md](ROBOT_INVENTORY.md) — read that before anything else. Two findings change the
+plan and are not yet resolved:
+
+- **The L1 lidar produces no data** (`error_state: 6`, zero point clouds). Height map, voxel map, `uslam`, and
+  the Unitree topological-graph interface should all be assumed unavailable. Leg odometry still works.
+- **Go2 message stamps run ~44 min behind the Jetson clock.** Snapshots and poses cannot be paired by header
+  stamp as written.
+
+Every known limitation and unknown is now catalogued in
+[OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) — read that before relying on any part of the system. Also outstanding
+from the survey: only one of the two D455 cameras is physically attached, no camera-to-body
+transform is published anywhere, nothing about the motion or safety path has been verified on hardware (the
+survey sent no commands, and the pre-existing bridge's own README says its SDK path was never hardware-tested),
+and Nebius has no credentials configured and no client installed.
+
 ## Start here
 
-This repository is a planning scaffold. There is no working package, environment specification, robot adapter, API client, or test suite yet. Read `PROJECT_SPEC.md`, `ARCHITECTURE.md`, `EVALUATION.md`, and `HACKATHON.md` first.
+This repository is still a planning scaffold: `src/` contains only `.gitkeep` files, and there is no working
+package, environment specification, robot adapter, API client, or test suite yet. Read `PROJECT_SPEC.md`,
+`ARCHITECTURE.md`, `EVALUATION.md`, and `HACKATHON.md` first.
 
-The team has confirmed ROS 2, Jetson Orin access by SSH, and a front camera. An example from another project suggests RGB-D, odometry, and a TCP velocity receiver, but its topic names and safety behavior still need live verification. See [the robot inventory](ROBOT_INVENTORY.md) before implementing the robot adapter.
+The platform is now characterised: Jetson AGX Orin (JetPack R36.4.4, CUDA 12.6, ROS 2 Humble, CycloneDDS) on
+the Go2's 192.168.123.x network, with one working D455 giving 30 Hz aligned RGB-D at 640x480 and leg odometry
+at 245 Hz. Topic names, types, QoS, rates, and intrinsics are recorded in
+[the robot inventory](ROBOT_INVENTORY.md). Re-run `tools/live_survey.sh` to refresh that picture; it only reads.
 
 ## Ordered first work
 
-1. **Finish the live Go2 inventory:** verify the camera/depth/odometry topics and frames, command receiver, obstacle stopping, emergency stop, and what code may be published. Record only releasable interface details in [ROBOT_INVENTORY.md](ROBOT_INVENTORY.md).
+1. **Close out the inventory.** Sensing and state are verified. Still open: revive the lidar or commit to a
+   D455-only obstacle path, resolve the clock skew, measure and publish the camera-to-`base_link` transform,
+   and establish the command receiver's watchdog, obstacle stopping, and operator emergency stop. Record only
+   releasable interface details in [ROBOT_INVENTORY.md](ROBOT_INVENTORY.md).
 2. **Test physical feasibility in a bounded area:** collect robot-height snapshots of a standing dark-clothed distractor and a lying target at multiple distances; measure whether the robot can execute and stop one safe short move. Do not assume a person detector trained on standing pedestrians recognizes a lying person.
 3. **Verify Nebius access:** list models for the team's account, make an actual Nemotron text inference call, test a candidate vision model with one real snapshot, and record latency, output quality, response format, and model identity. Avoid committing credentials or identifiable private images.
 4. **Choose the first technical environment** based on the available Go2 stack. Establish a public mock robot and recorded-scene path before coupling model decisions to hardware.

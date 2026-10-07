@@ -24,6 +24,12 @@ dist/
 # Trial media and generated artifacts (curate public samples deliberately)
 evaluation/runs/
 demo/raw/
+# Captured snapshots. These default to /mnt/data, but a stray --out must not
+# push identifiable images into a public repository (see docs/HACKATHON.md).
+snapshots/
+**/snapshot.json
+**/color.png
+**/depth.png
 *.bag
 *.db3
 *.mcap

@@ -43,12 +43,28 @@ The first physical mission uses three to five viewing locations in a bounded, re
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Planned components, information flow, and model choices |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | Baselines, trial design, and metrics |
 | [docs/SETUP_HANDOFF.md](docs/SETUP_HANDOFF.md) | Ordered starting tasks and unresolved environment questions |
-| [docs/ROBOT_INVENTORY.md](docs/ROBOT_INVENTORY.md) | Confirmed Go2 setup facts, interface leads, and live checks |
+| [docs/ROBOT_INVENTORY.md](docs/ROBOT_INVENTORY.md) | **Verified** Jetson/Go2 platform survey: topics, types, QoS, rates, intrinsics, and what is still broken or unverified |
+| [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | **Authoritative register of limitations, unknowns, and risks** — read before relying on anything |
+| [docs/SNAPSHOTS.md](docs/SNAPSHOTS.md) | The RGB-D snapshot format, how to capture one, and why frames and poses are paired the way they are |
 | [docs/HACKATHON.md](docs/HACKATHON.md) | Current hackathon requirements, judging, submission checklist, and public-release boundaries |
-| `src/kinetra/` | Reserved for public, hackathon-specific implementation |
+| `src/kinetra/perception/` | Snapshot capture: `capture` (ROS 2 node, subscribe-only), `snapshot` and `clock` (no ROS dependency) |
+| `src/kinetra/` | Remaining packages reserved for public, hackathon-specific implementation |
+| `tools/live_survey.sh` | Read-only survey of the Jetson and Go2; sends no command to the robot |
 | `tests/`, `evaluation/`, `demo/` | Reserved for tests, trial artifacts, and demo material |
 
-There is no runnable application or installation procedure yet. The next agent should begin with [SETUP_HANDOFF.md](docs/SETUP_HANDOFF.md), verify hardware and model access, and then choose the technical environment. Do not present the planned interfaces or model names as implemented.
+The first implemented piece is RGB-D snapshot capture (`docs/SNAPSHOTS.md`). It runs against the live camera
+and its off-robot half has unit tests that need neither ROS nor hardware:
+
+```bash
+PYTHONPATH=src python3 -m pytest tests/ -q                                   # no robot needed
+PYTHONPATH=src:$PYTHONPATH python3 -m kinetra.perception.capture --dry-run   # on the Jetson
+```
+
+There is no end-to-end application yet. The next agent should begin with
+[SETUP_HANDOFF.md](docs/SETUP_HANDOFF.md) and [ROBOT_INVENTORY.md](docs/ROBOT_INVENTORY.md) — the platform has
+now been surveyed live, but the lidar is dead, robot and Jetson clocks disagree by ~44 minutes, no
+camera-to-body transform exists, the motion and safety path is untested on hardware, and Nebius access is
+unconfigured. Do not present the planned interfaces or model names as implemented.
 
 ## Hackathon constraints
 
