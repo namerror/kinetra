@@ -30,6 +30,11 @@ snapshots/
 **/snapshot.json
 **/color.png
 **/depth.png
+# Motion-check runs. These also default to /mnt/data, but motion.json is not a
+# name .gitignore would otherwise catch, and a run names the operator and spotter.
+motion/
+**/motion.json
+**/standing-signature.json
 *.bag
 *.db3
 *.mcap

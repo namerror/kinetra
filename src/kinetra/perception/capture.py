@@ -1,8 +1,11 @@
 """ROS 2 node that turns the live D455 streams into saved RGB-D snapshots.
 
-Subscribe-only by construction: this module creates no publisher and no service
-client, so it cannot move the robot or alter its configuration. Motion belongs to
-a separate robot-side controller (`docs/ARCHITECTURE.md`).
+Subscribe-only by construction: *this module* creates no publisher and no service
+client, so it cannot move the robot or alter its configuration. Commanding the
+robot lives in `kinetra.robot.motion_check` (`docs/MOTION.md`).
+
+**The two must never run in the same process.** `rclpy` and `unitree_sdk2py` both
+claim CycloneDDS domain 0, and whichever calls `dds_create_domain` second fails.
 
     python3 -m kinetra.perception.capture --label lying-target-2m --count 5
 

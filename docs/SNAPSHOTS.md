@@ -90,6 +90,9 @@ it is flagged in `pairing.pose_warning` so no later stage can mistake it for a l
 These are the limits that affect anyone *using* snapshots. The full project-wide register, including the risks
 to the demo premise, is in [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md).
 
+- **`capture.py` must not share a process with `kinetra.robot.motion_check`.** `rclpy` and `unitree_sdk2py`
+  both claim CycloneDDS domain 0, and whichever calls `dds_create_domain` second fails. Capture observations
+  and command the robot from separate processes ([MOTION.md](MOTION.md)).
 - **`capture.py` is not covered by automated tests.** It needs ROS 2 and a live camera, so only the ROS-free
   half is tested. It has been exercised by hand against the camera, failure paths included, but nothing guards
   it against regression.

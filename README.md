@@ -48,6 +48,8 @@ The first physical mission uses three to five viewing locations in a bounded, re
 | [docs/SNAPSHOTS.md](docs/SNAPSHOTS.md) | The RGB-D snapshot format, how to capture one, and why frames and poses are paired the way they are |
 | [docs/HACKATHON.md](docs/HACKATHON.md) | Current hackathon requirements, judging, submission checklist, and public-release boundaries |
 | `src/kinetra/perception/` | Snapshot capture: `capture` (ROS 2 node, subscribe-only), `snapshot` and `clock` (no ROS dependency) |
+| [docs/MOTION.md](docs/MOTION.md) | Bounded-motion bring-up: the stages, the limits, how to run one, and why `Move()` returning 0 proves nothing |
+| `src/kinetra/robot/` | Commanding the Go2: `motion_check` (staged bring-up, Unitree SDK only, never `rclpy`), plus `limits`, `stages` and `motion_log` (no ROS, no SDK) |
 | `src/kinetra/` | Remaining packages reserved for public, hackathon-specific implementation |
 | `tools/live_survey.sh` | Read-only survey of the Jetson and Go2; sends no command to the robot |
 | `tests/`, `evaluation/`, `demo/` | Reserved for tests, trial artifacts, and demo material |
@@ -59,6 +61,19 @@ and its off-robot half has unit tests that need neither ROS nor hardware:
 PYTHONPATH=src python3 -m pytest tests/ -q                                   # no robot needed
 PYTHONPATH=src:$PYTHONPATH python3 -m kinetra.perception.capture --dry-run   # on the Jetson
 ```
+
+Bounded motion is the second implemented piece (`docs/MOTION.md`). It runs one named stage per invocation,
+prints its exact command schedule first, and sends nothing without a typed confirmation. Its ceilings, the
+velocity profile, the readiness gate and the abort predicates import neither ROS nor the Unitree SDK, so they
+are unit tested without a robot:
+
+```bash
+PYTHONPATH=src python3 -m kinetra.robot.motion_check --list-stages            # sends nothing
+PYTHONPATH=src python3 -m kinetra.robot.motion_check --stage yaw --dry-run    # sends nothing
+```
+
+**No motion stage has been run yet.** A connected dry run has confirmed the interface, the subscription and
+the state stream, but a dry run sends no command, so the motion path on this robot remains untested.
 
 There is no end-to-end application yet. The next agent should begin with
 [SETUP_HANDOFF.md](docs/SETUP_HANDOFF.md) and [ROBOT_INVENTORY.md](docs/ROBOT_INVENTORY.md) — the platform has

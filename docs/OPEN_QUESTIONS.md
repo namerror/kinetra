@@ -18,6 +18,10 @@ without a live check — a catalogue entry, a model card, or a config flag is no
 *Untested.* The pre-existing bridge's documentation says the Unitree handheld remote overrides the SDK, but
 nobody has shown that on this robot. `/wirelesscontroller` at least makes remote input observable.
 *Closes with:* a spotter holding the remote, interrupting a commanded move, and the stop being measured.
+*Progress, October 14:* `kinetra.robot.motion_check --stage yaw-estop` is built for exactly this and
+disarms the predicates that would otherwise make *us* stop the robot during the interrupt -- armed, they fire
+the moment the remote takes over and the run can no longer distinguish "the remote stopped it" from "we
+stopped ourselves". The stage has not been run.
 
 **1.2 The motion path has never run on hardware — by anyone. [BLOCKING]**
 *Untested.* `/home/jetson/repos/robot_control`'s own README states the real `unitree_sdk2py` calls and the
@@ -25,6 +29,12 @@ RealSense capture were only exercised in `--dry-run` on a laptop. The first comm
 first real test, so it must be treated as a bring-up, not a routine step.
 *Closes with:* a single short move in a cleared area with a spotter, directions confirmed (+vx forward,
 +vy left, +wz left), and a measured stop distance.
+*Progress, October 14:* `kinetra.robot.motion_check` exists, with the `yaw` and `forward` stages built for
+this and 168 unit tests over the ceilings, the profile, the gate and the abort predicates. One **connected
+dry run** against the live robot confirmed the interface, the subscription, a 500 Hz state stream and a
+2688.88 s clock offset at 0.86 ms spread -- but it sent no command, because a dry run diverts `move` and
+`stop_move`. **No motion stage has been run, so this stays BLOCKING.** Note also that `+vy` is now refused
+outright, so only +vx and +wz will ever be confirmed.
 
 **1.3 Obstacle avoidance is switched on, but its main sensor is dead. [BLOCKING]**
 *Measured.* `/multiplestate` (1 Hz) reports `obstaclesAvoidSwitch: true`, while the L1 lidar produces no point
@@ -34,26 +44,48 @@ feature gates `SportClient.Move` at all, or only the app's own joystick path.
 *Closes with:* deciding explicitly not to rely on it, and separately testing whether a commanded move toward a
 real obstacle is modified. Until then, assume **nothing** stops the robot but the operator.
 
-**1.4 Kinetra has no agreed motion limits. [BLOCKING]**
-*Open decision.* The bridge's defaults (0.4 m/s forward, 0.1 back, 0.05 lateral, 0.6 rad/s yaw, 0.5 s stale
-timeout) are another project's settings, not ours. Maximum move length, safety perimeter, and speed for the
-demo area are undecided.
-*Closes with:* a written limit set in `docs/PROJECT_SPEC.md` before the first trial.
+**1.4 Kinetra's motion limits are agreed and written down. [CLOSED October 14, 2026]**
+*Decided.* The approved set is in `docs/PROJECT_SPEC.md` ("Approved motion limits"), and
+`src/kinetra/robot/limits.py` is its executable copy: forward 0.15 m/s, reverse and lateral refused, yaw
+0.30 rad/s, a 2.0 s commanded window, 0.35 m commanded travel, 20 Hz, 0.30 s staleness, `StopMove()` as the
+terminal state. A value above a ceiling is refused rather than clamped, and `tests/test_limits.py` fails if
+the document and the code diverge. The bridge's defaults were not adopted.
 
 **1.5 `mode 7` in `/sportmodestate` is undecoded. [UNKNOWN]**
 *Measured but not interpreted.* Foot forces were 9–17 (essentially unloaded), so the robot was not standing on
 its feet. We cannot currently tell "standing and ready" from "lying down" or "damping" in a log.
 *Closes with:* reading the SDK's mode enumeration, or observing the field across known physical states.
+*Progress, October 14:* **there is no mode enumeration to read.** The whole of `unitree_sdk2py` and the
+`unitree_ros2` packages were searched; `_SportModeState_.py` declares the field and nothing assigns meaning
+to its values. So `mode` is now treated as permanently opaque: `limits.py` records it and never compares it
+to a literal, and the readiness gate decides from foot force, attitude, error code and freshness instead.
+`body_height` is excluded for the same reason -- it read 0.32 while the robot lay with unloaded feet.
+`--stage handshake`, run standing, will record the first standing signature and calibrate the foot-force
+threshold, which is currently an admitted guess.
 
 **1.6 Arbitration with the robot's own controllers is unknown. [UNKNOWN]**
 *Measured.* `/api/sport/request` already has **12 publishers**, all internal Go2 services. Nothing is known
 about priority, last-writer-wins, or whether our commands can be overridden mid-move.
 *Closes with:* observing the topic while the robot is commanded, and reading the motion-switcher behaviour.
+*Progress, October 14:* the topic carries idle internal traffic even with nothing of ours running (api_id
+1034, polling `bodyHeight`/`footRaiseHeight`/`speedLevel`), and `/api/sport/response` carries a robot-side
+`status.code` keyed by `identity.id`. Since the SDK's `Move` is api_id 1008 on the same channel, watching
+both topics from a second terminal is the only independent confirmation that one of our commands reached the
+robot -- `Move`'s own return value cannot provide it (section 8). `motion_check` reads
+`MotionSwitcherClient.CheckMode()` in its handshake and deliberately never calls `SelectMode` or
+`ReleaseMode`.
 
 **1.7 No receiver-side watchdog is confirmed. [UNKNOWN]**
 *Untested.* The bridge stops on its own *sender* side when commands go stale. Whether anything on the **robot**
 stops if the Jetson process is killed mid-move, or the network drops, has not been shown.
 *Closes with:* killing the sender mid-move with a spotter present and measuring what happens.
+*Progress, October 14:* split into two stages, because most of this can be answered for free.
+`--stage watchdog-quiet` simply stops publishing while staying alive and fully able to `StopMove()`, which
+asks whether the robot stops when commands merely cease at **zero added risk**. Only then
+`--stage watchdog-kill` schedules its own `SIGKILL` mid-rotation; it yaws rather than walks so a persisting
+last command stays bounded in displacement, requires `--estop-evidence` from a `yaw-estop` run because
+nothing of ours survives the kill, and flushes its log every tick. Neither has been run. The self-kill and
+its partial log were verified against a simulated robot.
 
 ## 2. Sensing
 
@@ -154,6 +186,14 @@ The drift above was measured over 5.5 minutes on a stationary robot. Unmeasured:
 full mission, how the offset changes across a robot power cycle (it will differ, which is why it is never
 cached), whether the camera's stamp jumps are periodic, and whether any of this shifts once the robot is
 walking and the CPU is loaded.
+
+*Observed October 14, 2026, and a warning about how NOT to measure this:* the offset read 2687.29 s at 10:40
+and 2688.88 s at 15:03. That pair is **not** a drift measurement, because the Jetson rebooted between them
+and its system clock also stepped (`last -x reboot` records the boot at 11:18 while `uptime` implies 14:45).
+A reboot or an NTP correction on either side moves the offset discontinuously, so any two readings separated
+by one are incomparable. The same applies to comparing the October 7 figure (2628.60 s) with any later one.
+Drift can only be measured within a single uninterrupted window, which is what `clock.py` does over its
+rolling window and why the offset is never cached across a mission.
 
 ## 4. Snapshot capture — known limits
 
@@ -256,3 +296,62 @@ the final days.
 2. **§2.1 lidar triage, time-boxed to an hour**, then a written decision either way.
 3. **§2.2 camera transform** — a tape measure and a static transform publisher.
 4. **§1.1–1.4 safety** — before any autonomy, in a cleared area with a spotter.
+
+## 8. Bounded motion — known limits
+
+Added October 14, 2026, with `src/kinetra/robot/`. The operator-facing version is in
+[MOTION.md](MOTION.md).
+
+**8.1 `Move()` returning 0 is not evidence of anything on the robot. [LIMIT]**
+*Measured in source.* `SportClient.Move` is `_CallNoReply` (`rpc/client_base.py:49-56`): it returns 0 when
+the **local** DDS write succeeded, 3102 if it failed, 3103 if `Init()` was skipped. It is never an
+acknowledgement. Every logged command therefore carries a `proves` string, `moves_written` is labelled as
+writes, and a run where every write succeeded and no motion was observed exits **5, inconclusive** rather
+than 0. The actual evidence is `motion_onset_s`.
+
+**8.2 `Move()` can block for the whole `SetTimeout`. [LIMIT]**
+*Measured in source.* `core/channel.py:130-141` waits for a matched subscriber in 0.1 s steps before writing,
+so an unreachable robot turns a sub-millisecond call into a timeout-long one — and a blocking round-trip
+costs up to twice its timeout. The command loop therefore uses 0.2 s, shutdown 0.5 s, handshake 1.0 s, and
+the watchdog runs in its own non-daemon thread so a loop stuck inside an SDK call cannot delay its own
+remedy. Per-call durations are recorded in every log; nobody has measured them on this hardware yet.
+
+**8.3 The foot-force gate is uncalibrated. [LIMIT]**
+*Measured, insufficiently.* The only `foot_force` ever read on this robot is the lying-down `[7, 14, 14, 7]`,
+and the units are unknown. The default threshold of 50 is an admitted guess recorded in every log. A standing
+`handshake` run writes a signature and the threshold becomes half the lightest standing foot; every motion
+stage refuses to run until that file exists.
+*Closes with:* a standing `handshake` run.
+
+**8.4 `rclpy` and `unitree_sdk2py` cannot share a process. [LIMIT]**
+*Measured.* Both claim CycloneDDS domain 0 and the second `dds_create_domain` fails with
+`PRECONDITION_NOT_MET`. So `motion_check` is SDK-only and takes state from `ChannelSubscriber`, and
+`perception.capture` and `robot.motion_check` must never be combined. The SDK also passes its own inline XML
+to `dds_create_domain`, so the `CYCLONEDDS_URI` that pins `eno1` for ROS is **ignored** there — the interface
+must be named explicitly or the SDK may bind the wireless NIC and silently never reach the robot.
+
+**8.5 Commanded travel is an upper bound, not a prediction. [LIMIT]**
+The pre-send bound integrates the commanded profile assuming perfect instantaneous tracking. That is what a
+travel cap wants and is not what the robot will do. The geometric abort caps are checked against measured
+odometry instead, precisely because they must not trust the profile.
+
+**8.6 The odometry used to measure a stage is itself unvalidated. [LIMIT]**
+*Measured.* `position` and `velocity` come from the same onboard estimator, which reports an all-zero
+covariance (section 2.8), so their agreement proves little. Each motion stage takes `--tape-translation` and
+reports odometry, tape and their ratio: at a bring-up the tape measure is ground truth and the odometry is
+under test.
+
+**8.7 Most of `motion_check.py` is still hardware-only. [LIMIT]**
+168 tests cover the ceilings, the clamp, the profile, the readiness gate, the abort predicates, the log
+format, the CLI, the dry-run backend and the signature handling — a deliberate improvement on `capture.py`,
+which is untestable because its risky logic sits inside a ROS node (section 4). What remains untestable:
+participant creation and interface binding, `SportClient`/`MotionSwitcherClient` behaviour, whether the robot
+moves at all, whether `+vx`/`+wz` are forward and left, whether the remote overrides us, whether anything
+robot-side stops a move after SIGKILL, and whether `Move` is gated by the Go2's own obstacle avoidance. Those
+are the findings the stages exist to produce.
+
+**8.8 `/tmp/cdds.LOG` cannot be turned off. [LIMIT]**
+*Measured.* The SDK's inline config sets CycloneDDS tracing to a fixed path whenever an interface is named.
+It reached 13 KB in a single connected dry run. `/` has 16 GB free, so this wants watching across many runs
+but is not otherwise harmful. The SDK also prints `[Reader] take sample error` on teardown.
+
