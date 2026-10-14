@@ -416,8 +416,9 @@ def describe_schedule(stage: StageSpec, limits: MotionLimits,
     lines.append(row("", f"commanded translation {bounds['commanded_translation_m']:.3f} m "
                          f"of {bounds['translation_cap_m']:.3f} m cap -- open-loop upper "
                          "bound, not a prediction"))
-    lines.append(row("gate", f"all four feet >= {limits.min_foot_force:g} force "
-                             "(UNCALIBRATED), error_code 0, state fresh and advancing"))
+    lines.append(row("gate", f"foot force >= {limits.min_foot_force_sum:g} in total "
+                             f"(this decides standing) and >= {limits.min_foot_force:g} "
+                             "per foot, error_code 0, state fresh and advancing"))
     lines.append(row("", "mode and body_height are recorded, never asserted: both read "
                          "'standing-ish' while the robot was lying down"))
     lines.append(row("abort if", "state stops arriving or goes stale, travel or rotation "

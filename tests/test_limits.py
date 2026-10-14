@@ -10,7 +10,12 @@ import math
 import pytest
 
 from kinetra.robot.limits import (
+    BENIGN_ERROR_CODES,
     DEFAULT_MIN_FOOT_FORCE,
+    DWELL_ERROR_CODE_S,
+    FOOT_FORCE_LYING_MAX_OBSERVED,
+    FOOT_FORCE_STANDING_MIN_OBSERVED,
+    FOOT_FORCE_SUM_MIN,
     DWELL_FEET_S,
     DWELL_NO_ONSET_S,
     FOOT_FORCE_LYING_OBSERVED,
@@ -298,10 +303,82 @@ def test_every_readiness_failure_is_reported_not_just_the_first():
     assert len(verdict.reasons) >= 4
 
 
-def test_the_gate_records_the_uncalibrated_foot_force_threshold_it_used():
+def test_the_gate_records_the_foot_force_threshold_it_used():
     verdict = assess_readiness(make_state(), make_stream(), 1000.0, make_limits())
     assert verdict.observations["min_foot_force_required"] == DEFAULT_MIN_FOOT_FORCE
-    assert "UNCALIBRATED" in verdict.observations["min_foot_force_note"]
+    assert verdict.observations["foot_force_sum_required"] == FOOT_FORCE_SUM_MIN
+
+
+def test_the_total_is_what_separates_the_two_states_not_the_lightest_foot():
+    # The lightest foot drifted down to 19 while lying reads up to 17, leaving
+    # two counts between the states -- unusable. The total still separates them
+    # by 121 against 49, so the total is the gate and the per-foot floor is
+    # deliberately set BELOW the lying readings, because deciding lying is not
+    # its job.
+    assert FOOT_FORCE_SUM_MIN > 4 * DEFAULT_MIN_FOOT_FORCE
+    assert DEFAULT_MIN_FOOT_FORCE < FOOT_FORCE_LYING_MAX_OBSERVED
+    assert FOOT_FORCE_SUM_MIN < 4 * FOOT_FORCE_STANDING_MIN_OBSERVED
+
+
+def test_every_reading_measured_on_this_robot_lands_on_the_right_side_of_the_gate():
+    limits, stream = make_limits(), make_stream()
+
+    for lying in ((8, 13, 12, 8), (7, 14, 14, 7), (9, 16, 17, 7)):
+        verdict = assess_readiness(make_state(foot_force=lying), stream, 1000.0, limits)
+        assert not verdict.ready, f"{lying} passed the gate while lying down"
+
+    # Every standing sample taken on 2026-10-14, including the weakest stance,
+    # where the lightest foot settled to 25.
+    for standing in ((29, 34, 43, 30), (31, 36, 45, 29), (30, 35, 45, 31),
+                     (30, 37, 45, 28), (26, 37, 45, 25)):
+        verdict = assess_readiness(make_state(foot_force=standing), stream, 1000.0, limits)
+        assert verdict.ready, f"{standing} was refused while standing: {verdict.reasons}"
+
+
+def test_a_single_lifted_leg_is_refused_even_in_an_otherwise_strong_stance():
+    verdict = assess_readiness(make_state(foot_force=(0, 45, 50, 45)), make_stream(),
+                               1000.0, make_limits())
+    assert not verdict.ready
+
+
+def test_a_plausible_per_foot_reading_with_too_little_total_is_refused():
+    # Every foot bears something, so the per-foot floor passes this, but 80 is
+    # far short of the 121-141 a standing robot measured.
+    verdict = assess_readiness(make_state(foot_force=(20, 20, 20, 20)), make_stream(),
+                               1000.0, make_limits())
+    assert not verdict.ready
+    assert any("total foot force" in r for r in verdict.reasons)
+
+
+def test_the_total_floor_is_high_enough_to_ever_fire():
+    # A floor at or below 4x the per-foot floor would be dead code dressed as a
+    # safety check, since the per-foot gate already guarantees that much.
+    assert FOOT_FORCE_SUM_MIN > 4 * DEFAULT_MIN_FOOT_FORCE
+
+
+def test_the_drifted_standing_readings_still_pass_and_the_lying_ones_still_fail():
+    # The readings that broke the previous gate: a standing robot whose sensors
+    # had drifted to [19, 36, 46, 20], against every lying reading on record.
+    limits, stream = make_limits(), make_stream()
+    assert assess_readiness(make_state(foot_force=(19, 36, 46, 20)), stream, 1000.0,
+                            limits).ready
+    for lying in ((8, 13, 12, 8), (7, 14, 14, 7), (9, 16, 17, 7), (0, 12, 12, 0)):
+        assert not assess_readiness(make_state(foot_force=lying), stream, 1000.0,
+                                    limits).ready, lying
+
+
+def test_an_operator_can_override_both_floors_because_their_basis_drifts():
+    tight = make_limits(min_foot_force=30.0, min_foot_force_sum=200.0)
+    verdict = assess_readiness(make_state(foot_force=(19, 36, 46, 20)), make_stream(),
+                               1000.0, tight)
+    assert not verdict.ready
+    assert verdict.observations["foot_force_sum_required"] == 200.0
+
+
+def test_the_gate_records_the_total_it_measured():
+    verdict = assess_readiness(make_state(foot_force=(30, 37, 45, 28)), make_stream(),
+                               1000.0, make_limits())
+    assert verdict.observations["foot_force_sum"] == 140
 
 
 def test_the_handshake_gate_can_skip_the_standing_checks():
@@ -310,7 +387,9 @@ def test_the_handshake_gate_can_skip_the_standing_checks():
                                make_stream(), 1000.0, make_limits(),
                                require_motion_ready=False)
     assert verdict.ready
-    assert verdict.observations["loaded_feet"] == 0
+    # The standing checks are skipped entirely, not merely passed.
+    assert not any("total foot force" in r for r in verdict.reasons)
+    assert verdict.observations["foot_force_sum"] == sum(FOOT_FORCE_LYING_OBSERVED)
 
 
 # -- abort predicates -------------------------------------------------------
@@ -336,10 +415,51 @@ def test_abort_trips_on_a_stale_sample():
 def test_abort_trips_on_an_error_code_change_not_merely_a_nonzero_value():
     # A nonzero baseline is plausible here with the lidar dead, so demanding
     # zero would be code that gets edited to ignore the field.
-    started_faulty = AbortMonitor(make_state(error_code=6), AbortCriteria())
-    assert started_faulty.observe(make_state(error_code=6), 1000.0, Velocity()) is None
-    verdict = started_faulty.observe(make_state(error_code=7), 1000.0, Velocity())
+    m = AbortMonitor(make_state(error_code=6), AbortCriteria())
+    assert m.observe(make_state(error_code=6), 1000.0, Velocity()) is None
+    assert m.observe(make_state(error_code=7), 1000.0, Velocity()) is None
+    later = 1000.0 + DWELL_ERROR_CODE_S + 0.01
+    verdict = m.observe(make_state(received_monotonic=later, error_code=7), later,
+                        Velocity())
     assert verdict is not None and verdict.predicate == "error_code_change"
+
+
+def test_the_locomotion_error_code_never_aborts_however_long_it_persists():
+    # Measured over two runs: error_code goes 0 -> 2 within 5 ms of the first
+    # Move, as the robot enters a trot, and STAYS at 2 continuously for as long
+    # as it walks -- 829 samples with no break -- clearing only once it settles.
+    # The first run looked like a 0.656 s transient only because that run
+    # aborted at 0.052 s and the robot stopped. So no dwell can work: a dwell
+    # merely moves the spurious abort later in the stage.
+    m = AbortMonitor(make_state(), AbortCriteria())
+    for i in range(400):                       # 4 s, twice any stage window
+        t = 1000.0 + i * 0.01
+        assert m.observe(make_state(received_monotonic=t, error_code=2), t,
+                         Velocity(wz=0.3)) is None, f"aborted at +{i * 0.01:.2f}s"
+    assert m.verdict is None
+    # Still reported, so a tolerated code leaves a trace in the log.
+    assert m.error_codes_seen == (2,)
+
+
+def test_an_undocumented_error_code_still_aborts_on_the_dwell():
+    # An unexplained code is the dangerous case, and is the reason this
+    # predicate still exists at all.
+    m = AbortMonitor(make_state(), AbortCriteria())
+    for offset in (0.0, 0.5, 0.9):
+        t = 1000.0 + offset
+        assert m.observe(make_state(received_monotonic=t, error_code=9), t,
+                         Velocity(wz=0.3)) is None
+    t = 1000.0 + DWELL_ERROR_CODE_S + 0.01
+    verdict = m.observe(make_state(received_monotonic=t, error_code=9), t,
+                        Velocity(wz=0.3))
+    assert verdict is not None and verdict.predicate == "error_code_change"
+    assert "undocumented" in verdict.reason
+
+
+def test_only_codes_that_have_been_explained_are_tolerated():
+    assert 2 in BENIGN_ERROR_CODES
+    assert "locomotion" in BENIGN_ERROR_CODES[2]
+    assert 9 not in BENIGN_ERROR_CODES
 
 
 def test_abort_trips_on_travel_beyond_the_cap():
@@ -414,6 +534,39 @@ def test_no_onset_does_not_trip_while_the_robot_is_actually_moving():
                      commanded_since_s=1.0) is None
 
 
+def test_no_onset_tolerates_a_gait_cycling_through_zero():
+    # Real yaw_speed samples from a genuine trot (run 20261014T172046_078_yaw).
+    # A gait oscillates through zero several times a second -- 25 of 40 samples
+    # in one 80 ms window of that run read as stationary -- so judging on the
+    # newest sample alone aborts a robot that is plainly walking.
+    trot = [-0.0799, -0.0714, -0.0650, -0.0341, -0.0107, +0.0138, +0.0096,
+            +0.0479, +0.0799, +0.0767, -0.2003, -0.2333, -0.0735, -0.0490]
+    m = monitor()
+    for i, yaw in enumerate(trot * 4):
+        t = 1000.0 + i * 0.012
+        verdict = m.observe(make_state(received_monotonic=t, yaw_speed_rps=yaw), t,
+                            Velocity(wz=0.3), commanded_since_s=i * 0.012)
+        assert verdict is None, f"aborted a walking robot at sample {i}: {verdict}"
+
+
+def test_no_onset_still_trips_once_motion_genuinely_stops():
+    m = monitor()
+    # Moves briefly, then goes quiet for longer than the dwell.
+    t = 1000.0
+    m.observe(make_state(received_monotonic=t, yaw_speed_rps=0.28), t,
+              Velocity(wz=0.3), commanded_since_s=0.1)
+    for offset in (0.2, 0.4, 0.55):
+        t = 1000.0 + offset
+        assert m.observe(make_state(received_monotonic=t), t, Velocity(wz=0.3),
+                         commanded_since_s=offset) is None
+    # Quiet for the full dwell since motion was last seen, so it trips here.
+    t = 1000.0 + DWELL_NO_ONSET_S
+    verdict = m.observe(make_state(received_monotonic=t), t, Velocity(wz=0.3),
+                        commanded_since_s=t - 1000.0)
+    assert verdict is not None and verdict.predicate == "no_onset"
+    assert "none in the last" in verdict.reason
+
+
 def test_a_nonzero_return_code_aborts_and_an_unknown_one_is_named_as_unsafe():
     verdict = monitor().observe(make_state(), 1000.0, Velocity(), return_code=3102)
     assert verdict is not None and verdict.predicate == "rpc_error"
@@ -464,6 +617,15 @@ def test_displacement_ignores_body_height_because_crouching_is_not_travel():
 def test_motion_onset_is_none_when_the_robot_never_moved():
     samples = [make_state(received_monotonic=1000.0 + i * 0.05) for i in range(20)]
     assert motion_onset(samples, 1000.0) is None
+
+
+def test_motion_onset_is_timed_from_a_zero_command_too():
+    # Move(0,0,0) is not a no-op on this robot: it enters locomotion and starts
+    # the gait. So onset must be timed from the first Move of any magnitude, or
+    # it misses the command the robot actually responded to.
+    samples = [make_state(received_monotonic=1000.0 + i * 0.002) for i in range(12)]
+    samples.append(make_state(received_monotonic=1000.023, yaw_speed_rps=-0.11))
+    assert motion_onset(samples, 1000.0) == pytest.approx(0.023, abs=1e-9)
 
 
 def test_motion_onset_is_measured_from_the_first_command_and_ignores_earlier_noise():

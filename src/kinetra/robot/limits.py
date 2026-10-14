@@ -90,15 +90,51 @@ ABORT_TILT_RAD = 0.20
 # walking, so the one automatic escalation to Damp() cannot fire in normal use.
 FALL_TILT_RAD = 0.60
 
-# UNCALIBRATED. The only foot_force ever measured on this robot is
-# [7, 14, 14, 7] while it was LYING DOWN, and the units are unknown
-# (docs/OPEN_QUESTIONS.md 1.5). 50 is a guess set well above that, and the
-# handshake stage exists to replace it with a measurement. It is recorded in
-# every log so no run can be read without knowing which value gated it.
-DEFAULT_MIN_FOOT_FORCE = 50.0
+# CALIBRATED October 14, 2026, against both physical states on this robot.
+#
+# Lying: foot_force [8, 13, 12, 8] summing to 41, and [7, 14, 14, 7] on
+# October 7; the widest lying reading on a single foot is 17.
+# Standing: the lightest foot wandered over 25-31 and the sum over 133-142,
+# across five runs and a 5000-sample window, with the robot simply standing
+# still. So the lightest foot separates the two states by only about 2x and
+# drifts, while the TOTAL separates them by 3.3x and is well behaved.
+#
+# Then the readings kept falling, on a continuously standing robot AND on a
+# freshly stood one: the lightest foot went 29, 30, 28, 25, 22, 19 and the total
+# 141 down to 121, while `body_height` held at exactly 0.320 throughout. Load
+# that falls while the geometry does not move is not a stance change, so this is
+# very probably foot-force sensor drift, plausibly thermal -- the IMU read 79 C
+# at the survey. See docs/OPEN_QUESTIONS.md 8.3.
+#
+# That leaves the lightest foot almost useless for telling the states apart:
+# worst standing 19 against worst lying 17. The TOTAL still separates cleanly,
+# 121 standing against 49 lying, so it carries the whole standing decision and
+# this per-foot floor is demoted to what it can actually do -- catch a foot
+# bearing nothing at all. 8 is below every lying reading on purpose: deciding
+# lying is not this check's job.
+#
+# Units unknown, and specific to this robot. Both values are recorded in every
+# log so no run can be read without knowing what gated it, and both are now
+# operator-overridable because their basis is known to drift.
+DEFAULT_MIN_FOOT_FORCE = 8.0
 FOOT_FORCE_LYING_OBSERVED = (7, 14, 14, 7)
+# The widest single-foot reading ever seen while lying down. Any derived
+# threshold must stay clear of this, or the gate would pass a lying robot.
+FOOT_FORCE_LYING_MAX_OBSERVED = 17
+FOOT_FORCE_STANDING_MIN_OBSERVED = 25
+# THE standing check, and the only one of the two that still works. Across the
+# whole of 2026-10-14: lying totalled 24-49, standing 121-141. 90 sits 1.8x
+# above the worst lying reading and 26% below the worst standing one, which
+# leaves about 31 counts of room for the drift above before it would refuse a
+# standing robot again.
+#
+# It must stay above 4 x the per-foot floor to do any work at all; an earlier
+# 90 was dead code against a per-foot floor of 25, which already guaranteed 100.
+# Against a floor of 8 the minimum reachable total is 32, so this bites.
+FOOT_FORCE_SUM_MIN = 90.0
 # A lifted leg, or a robot leaning on something, shows up as one foot far below
-# the mean even when the total looks plausible.
+# the mean even when the total looks plausible. Standing measured 0.79 here, so
+# 0.35 leaves ample room.
 FOOT_FORCE_BALANCE_RATIO = 0.35
 
 # Velocity below this counts as stopped, matching the bridge's deadband.
@@ -222,6 +258,7 @@ class MotionLimits:
     yaw_accel_rps2: float = DEFAULT_YAW_ACCEL_RPS2
     command_rate_hz: float = DEFAULT_COMMAND_RATE_HZ
     min_foot_force: float = DEFAULT_MIN_FOOT_FORCE
+    min_foot_force_sum: float = FOOT_FORCE_SUM_MIN
     max_state_age_s: float = DEFAULT_MAX_STATE_AGE_S
     deadband: float = DEFAULT_DEADBAND
 
@@ -254,7 +291,7 @@ class MotionLimits:
                 f"{MIN_COMMAND_RATE_HZ} Hz; Move() is fire-and-forget and must be "
                 "re-issued often enough that one dropped tick is not a long gap")
         for name in ("accel_mps2", "yaw_accel_rps2", "min_foot_force",
-                     "max_state_age_s", "deadband"):
+                     "min_foot_force_sum", "max_state_age_s", "deadband"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive, got {value!r}")
@@ -276,10 +313,12 @@ class MotionLimits:
             "yaw_accel_rps2": self.yaw_accel_rps2,
             "command_rate_hz": self.command_rate_hz,
             "min_foot_force": self.min_foot_force,
+            "min_foot_force_sum": self.min_foot_force_sum,
             "min_foot_force_note": (
-                "UNCALIBRATED: the only foot_force measured on this robot is "
-                f"{list(FOOT_FORCE_LYING_OBSERVED)} while LYING DOWN, and the units "
-                "are unknown"),
+                "measured 2026-10-14: lying totalled 24-49, standing 121-141, and the "
+                "standing reading drifts downward even after a fresh stand (probably "
+                "sensor drift). min_foot_force_sum decides standing; min_foot_force only "
+                "catches a foot bearing nothing. Units unknown"),
             "max_state_age_s": self.max_state_age_s,
             "deadband": self.deadband,
         }
@@ -535,7 +574,9 @@ def assess_readiness(state: StateSignature | None, stream: StreamHealth | None,
     observations: dict[str, Any] = {
         "min_foot_force_required": limits.min_foot_force,
         "min_foot_force_note": (
-            "UNCALIBRATED; no standing foot_force has ever been recorded on this robot"),
+            "calibrated 2026-10-14: lying 8-17 per foot (41 total), standing 25-45 "
+            "(133-142 total). The total decides standing; this floor catches a lifted "
+            "leg. Units unknown"),
     }
 
     if state is None:
@@ -555,6 +596,8 @@ def assess_readiness(state: StateSignature | None, stream: StreamHealth | None,
                              "lying with unloaded feet, so it does not discriminate standing"),
         "foot_force": list(state.foot_force),
         "loaded_feet": state.loaded_feet(limits.min_foot_force),
+        "foot_force_sum": sum(state.foot_force),
+        "foot_force_sum_required": limits.min_foot_force_sum,
         "roll_rad": state.roll_rad,
         "pitch_rad": state.pitch_rad,
         "speed_mps": state.speed_mps,
@@ -594,8 +637,14 @@ def assess_readiness(state: StateSignature | None, stream: StreamHealth | None,
         reasons.append(
             f"feet {unloaded} are below {limits.min_foot_force:g} force "
             f"(foot_force {list(state.foot_force)}) -- the robot is not standing on them")
-    else:
-        mean = sum(state.foot_force) / 4.0
+    total = sum(state.foot_force)
+    if total < limits.min_foot_force_sum:
+        reasons.append(
+            f"total foot force {total} is below {limits.min_foot_force_sum:g}; on this "
+            f"robot lying totalled 24-49 and standing 121-141")
+
+    if not unloaded:
+        mean = total / 4.0
         if min(state.foot_force) < FOOT_FORCE_BALANCE_RATIO * mean:
             reasons.append(
                 f"foot_force {list(state.foot_force)} is lopsided: the lightest foot is "
@@ -653,6 +702,29 @@ DWELL_FALL_S = 0.20
 DWELL_OVERSPEED_S = 0.15
 DWELL_FEET_S = 0.20
 DWELL_NO_ONSET_S = 0.60
+# `error_code` is not a fault field alone. Measured over two runs on
+# 2026-10-14: it goes 0 -> 2 within 5 ms of the first Move, exactly as `mode`
+# goes 1 -> 3 and the robot enters a trot, and it stays at 2 for as long as the
+# robot keeps walking -- continuously, 829 samples with no break -- clearing
+# about 0.6 s after StopMove once the robot settles.
+#
+# The first run appeared to show a 0.656 s transient, but only because that run
+# aborted at 0.052 s and the robot stopped. So no dwell can work here: 2 is set
+# for the whole of any motion stage, and a dwell merely moves the spurious abort
+# later. Code 2 is a status flag meaning "walking" and never aborts.
+#
+# An UNKNOWN nonzero code still aborts, on this dwell, because an unexplained
+# code is the dangerous case. 1.0 s is long enough that a momentary flicker
+# during a mode change does not kill a run, and short enough to stop a latching
+# fault inside a 2 s window.
+DWELL_ERROR_CODE_S = 1.0
+# Codes explained by observation rather than documentation. Each is recorded in
+# every log but never aborts, because each is known to accompany a normal state
+# rather than report a failure. A code NOT listed here aborts on the dwell
+# above: this list is what has been seen AND explained, nothing more.
+BENIGN_ERROR_CODES = {
+    2: "set for the duration of locomotion (mode 3); clears when the robot settles",
+}
 
 
 @dataclass(frozen=True)
@@ -683,6 +755,15 @@ class AbortMonitor:
         self._baseline_error_code = start.error_code
         self._since: dict[str, float] = {}
         self._verdict: AbortVerdict | None = None
+        # Every code seen is reported even when none of them aborted, so a
+        # tolerated transient still leaves a trace in the log.
+        self._error_codes_seen: set[int] = set()
+        # The last time motion was OBSERVED, not whether the newest sample
+        # happens to show it. A trot oscillates yaw rate and speed through zero
+        # several times a second -- on real data, 25 of 40 samples in an 80 ms
+        # window of a genuine trot read as stationary -- so an instantaneous
+        # check false-positives on a robot that is plainly walking.
+        self._last_moving: float | None = None
 
     @property
     def verdict(self) -> AbortVerdict | None:
@@ -692,6 +773,11 @@ class AbortMonitor:
     @property
     def baseline_error_code(self) -> int:
         return self._baseline_error_code
+
+    @property
+    def error_codes_seen(self) -> tuple[int, ...]:
+        """Every code observed to differ from the baseline, aborting or not."""
+        return tuple(sorted(self._error_codes_seen))
 
     def _dwelled(self, key: str, now: float, condition: bool, dwell_s: float) -> bool:
         if not condition:
@@ -730,13 +816,20 @@ class AbortMonitor:
                               f"state is {age * 1e3:.0f} ms old, limit "
                               f"{c.max_state_age_s * 1e3:.0f} ms")
 
-        if state.error_code != self._baseline_error_code:
-            # A change, not a nonzero value: a nonzero baseline is plausible on
-            # this robot with the lidar dead, and code that demands 0 here is
-            # code that gets edited to ignore the field.
+        # A change, not a nonzero value: a nonzero baseline is plausible on this
+        # robot with the lidar dead, and code that demands 0 here is code that
+        # gets edited to ignore the field. But it needs a dwell, because the
+        # field also flags normal transitions -- see DWELL_ERROR_CODE_S.
+        changed = state.error_code != self._baseline_error_code
+        if changed:
+            self._error_codes_seen.add(state.error_code)
+        # An explained code is recorded and tolerated however long it persists.
+        unexplained = changed and state.error_code not in BENIGN_ERROR_CODES
+        if self._dwelled("error_code", now_monotonic, unexplained, DWELL_ERROR_CODE_S):
             return self._trip("error_code_change",
                               f"error_code changed from {self._baseline_error_code} "
-                              f"to {state.error_code}")
+                              f"to {state.error_code}, which is undocumented and has "
+                              f"persisted {DWELL_ERROR_CODE_S:g} s")
 
         travel, rotation = displacement_between(self._start, state)
         if travel > c.max_translation_m:
@@ -781,18 +874,28 @@ class AbortMonitor:
                                   f"all four feet are unloaded (foot_force "
                                   f"{list(state.foot_force)})")
 
+        if state.is_moving():
+            self._last_moving = now_monotonic
+
         if (c.is_armed("no_onset") and commanded_since_s is not None
                 and not commanded.is_stopped(self._criteria_deadband())):
             # The only predicate that catches "Move() returned 0 and the robot
             # ignored it". It aborts rather than retries: publishing into an
             # unresponsive robot is how a surprise lurch happens when whatever
             # was blocking clears.
-            stalled = commanded_since_s >= DWELL_NO_ONSET_S and not state.is_moving()
-            if stalled:
+            #
+            # Judged on when motion was last SEEN rather than on the newest
+            # sample, because a gait cycles through zero and would otherwise
+            # abort a walking robot.
+            quiet_for = (commanded_since_s if self._last_moving is None
+                         else now_monotonic - self._last_moving)
+            if commanded_since_s >= DWELL_NO_ONSET_S and quiet_for >= DWELL_NO_ONSET_S:
+                seen = ("" if self._last_moving is None
+                        else f", and none in the last {quiet_for:.2f} s")
                 return self._trip("no_onset",
                                   f"commanded motion for {commanded_since_s:.2f} s and the "
-                                  "robot has not moved; a Move() return of 0 is only a "
-                                  "local DDS write")
+                                  f"robot has not moved{seen}; a Move() return of 0 is only "
+                                  "a local DDS write")
 
         return None
 

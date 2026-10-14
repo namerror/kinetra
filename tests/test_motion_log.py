@@ -201,8 +201,20 @@ def test_the_measurement_reports_odometry_against_the_tape_measure():
     assert "under test" in payload["ground_truth_note"]
 
 
+def test_rotation_is_compared_against_the_operators_own_measurement():
+    # The yaw stages turn on this comparison, so a stored rotation reading that
+    # was never compared to anything would be a field that earns nothing.
+    import math
+    measurement = Measurement(rotation_rad=math.radians(30.0), tape_rotation_deg=25.0)
+    payload = measurement.to_dict()
+    assert payload["rotation_deg"] == pytest.approx(30.0)
+    assert payload["rotation_odometry_over_tape"] == pytest.approx(1.2)
+
+
 def test_the_measurement_tolerates_a_missing_tape_reading():
-    assert Measurement(translation_m=0.24).to_dict()["odometry_over_tape"] is None
+    payload = Measurement(translation_m=0.24, rotation_rad=0.45).to_dict()
+    assert payload["odometry_over_tape"] is None
+    assert payload["rotation_odometry_over_tape"] is None
 
 
 def test_stop_distance_is_recorded_separately_from_stage_displacement():
@@ -268,9 +280,13 @@ def test_the_readiness_observations_survive_the_round_trip_including_mode():
     assert payload["readiness"]["observations"]["loaded_feet"] == 4
 
 
-def test_the_log_carries_the_uncalibrated_foot_force_caveat_with_the_limits():
-    payload = make_log().to_metadata()
-    assert "UNCALIBRATED" in payload["limits"]["min_foot_force_note"]
+def test_the_log_says_where_the_foot_force_threshold_came_from():
+    # The threshold is robot-specific and in unknown units, so a log that
+    # recorded only the number would not be auditable later.
+    note = make_log().to_metadata()["limits"]["min_foot_force_note"]
+    assert "measured 2026-10-14" in note
+    assert "drifts" in note
+    assert "Units unknown" in note
 
 
 def test_the_log_records_the_stage_schedule_and_its_open_loop_bound():

@@ -15,6 +15,7 @@ owns its `to_dict()`, and `save()` writes `motion.json` with `indent=2`.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,9 @@ RETURN_CODE_NOTES: dict[str, str] = {
         "fire-and-forget (_CallNoReply): 0 means the local DDS write succeeded and "
         "nothing more. It is NOT evidence the robot received, accepted or acted on "
         "the command. The evidence for that is motion_onset_s."),
+    "SportClient.Init": (
+        "local only: registers the api ids and talks to nothing. Without it every call "
+        "above api id 100 is rejected locally with 3103 and never reaches the robot."),
     "SportClient.StopMove": "blocking round-trip: the code is returned by the robot.",
     "SportClient.GetServerApiVersion": (
         "blocking round-trip, and it works before Init() because api id 1 bypasses "
@@ -138,6 +142,13 @@ class Measurement:
         if (self.tape_translation_m is not None and self.translation_m is not None
                 and self.tape_translation_m > 0.0):
             ratio = self.translation_m / self.tape_translation_m
+        # The same comparison for rotation, which the yaw stages turn on. Both
+        # are reported as odometry-over-external, so a value above 1 means the
+        # robot overstated what it did.
+        rotation_ratio: float | None = None
+        if (self.tape_rotation_deg is not None and self.rotation_rad is not None
+                and abs(self.tape_rotation_deg) > 0.0):
+            rotation_ratio = math.degrees(self.rotation_rad) / self.tape_rotation_deg
         return {
             "translation_m": self.translation_m,
             "rotation_rad": self.rotation_rad,
@@ -153,7 +164,10 @@ class Measurement:
             "settle_time_s": self.settle_time_s,
             "tape_translation_m": self.tape_translation_m,
             "tape_rotation_deg": self.tape_rotation_deg,
+            "rotation_deg": (None if self.rotation_rad is None
+                             else math.degrees(self.rotation_rad)),
             "odometry_over_tape": ratio,
+            "rotation_odometry_over_tape": rotation_ratio,
             "ground_truth_note": ("the tape measure is ground truth here and the odometry "
                                   "is under test: position and velocity come from the same "
                                   "onboard estimator, which reports zero covariance"),

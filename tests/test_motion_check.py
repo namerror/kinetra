@@ -16,6 +16,8 @@ import pytest
 
 from kinetra.robot.limits import MotionLimits, StateSignature, Velocity
 from kinetra.robot.motion_check import (
+    EXIT_ABORTED,
+    EXIT_INCONCLUSIVE,
     EXIT_NO_DATA,
     EXIT_OK,
     EXIT_REFUSED,
@@ -216,16 +218,25 @@ def test_a_missing_or_malformed_signature_reads_as_absent(tmp_path):
     assert read_signature(wrong) is None
 
 
-def test_the_gate_threshold_is_derived_from_the_signature_rather_than_guessed(tmp_path):
-    # The default is an admitted guess; a measured standing signature replaces
-    # it with half the lightest standing foot.
+def test_the_gate_threshold_is_not_derived_from_a_stance_snapshot(tmp_path):
+    # Fitting the per-foot floor to one standing reading was wrong twice: half
+    # the lightest foot lands below a lying reading, and 0.85 of a good stance
+    # refuses a merely adequate one. The floor exists to catch a lifted leg,
+    # which reads near zero whatever the stance, so it is a measured constant.
     write_signature(tmp_path / "standing-signature.json",
                     make_state(foot_force=(200, 180, 190, 184)), {})
     main(["--stage", "yaw", "--dry-run", "--offline", "--out", str(tmp_path),
           "--warmup", "0.1"])
     payload = json.loads(next(tmp_path.glob("*_yaw/motion.json")).read_text())
-    assert payload["limits"]["min_foot_force"] == pytest.approx(90.0)
-    assert payload["limits"]["min_foot_force"] != MotionLimits().min_foot_force
+    assert payload["limits"]["min_foot_force"] == MotionLimits().min_foot_force
+
+
+def test_an_explicit_threshold_flag_still_overrides_the_default(tmp_path):
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    main(["--stage", "yaw", "--dry-run", "--offline", "--out", str(tmp_path),
+          "--warmup", "0.1", "--min-foot-force", "33"])
+    payload = json.loads(next(tmp_path.glob("*_yaw/motion.json")).read_text())
+    assert payload["limits"]["min_foot_force"] == pytest.approx(33.0)
 
 
 def test_an_offline_dry_run_never_writes_a_standing_signature(tmp_path):
@@ -262,6 +273,91 @@ def test_a_dry_run_outcome_is_tagged_so_it_cannot_be_read_as_a_real_run(tmp_path
           "--warmup", "1.4"])
     payload = json.loads(next(tmp_path.glob("*_handshake/motion.json")).read_text())
     assert payload["result"]["outcome"] == "dry-run-completed"
+
+
+def test_a_dry_run_is_not_aborted_for_the_robot_not_moving(tmp_path):
+    # Nothing is sent in a dry run, so `no_onset` would fire on every one of
+    # them at 0.6 s and hide the loop timing the rest of the window measures.
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    code = main(["--stage", "yaw", "--dry-run", "--offline", "--out", str(tmp_path),
+                 "--warmup", "1.4"])
+    payload = json.loads(next(tmp_path.glob("*_yaw/motion.json")).read_text())
+    assert payload["result"]["abort"] is None, payload["result"]["abort"]
+    # The loop sends while elapsed < window, so the tick at exactly 2.0 s is not
+    # sent -- the stop sequence's Move(0,0,0) covers it. A margin below that
+    # keeps the test from being flaky on a loaded Jetson.
+    assert 36 <= payload["result"]["moves_written"] <= len(payload["schedule"])
+    # It is still reported as inconclusive rather than as a success.
+    assert code == EXIT_INCONCLUSIVE
+
+
+# -- Init() must happen on every path -------------------------------------
+#
+# Regression tests for a real bug: `initialise()` was called only inside
+# `handshake()` and in main's dry-run branch, so a LIVE motion stage built a
+# client, never registered the api ids, and had every Move rejected locally with
+# 3103 -- publishing nothing at all while the log filled with ordinary-looking
+# error codes. The fix moved the call into the runner, which owns both paths.
+
+def test_a_motion_stage_initialises_the_command_path_before_commanding(tmp_path):
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    main(["--stage", "yaw", "--dry-run", "--offline", "--out", str(tmp_path),
+          "--warmup", "1.4"])
+    payload = json.loads(next(tmp_path.glob("*_yaw/motion.json")).read_text())
+    calls = [c["call"] for c in payload["commands"]]
+    assert "SportClient.Init" in calls
+    assert calls.index("SportClient.Init") < calls.index("SportClient.Move")
+
+
+def test_the_handshake_stage_also_records_its_init(tmp_path):
+    main(["--stage", "handshake", "--dry-run", "--offline", "--out", str(tmp_path),
+          "--warmup", "1.4"])
+    payload = json.loads(next(tmp_path.glob("*_handshake/motion.json")).read_text())
+    calls = [c["call"] for c in payload["commands"]]
+    # Init goes AFTER the version probe, which works unregistered, so that
+    # "unreachable" and "not registered" stay separable findings.
+    assert calls.index("SportClient.GetServerApiVersion") < calls.index("SportClient.Init")
+    assert calls.index("SportClient.Init") < calls.index("SportClient.StopMove")
+
+
+def test_initialising_is_part_of_the_backend_contract():
+    assert hasattr(MotionBackend, "initialise")
+    backend = DryRunBackend()
+    assert backend.initialised is False
+    backend.initialise()
+    assert backend.initialised is True
+
+
+def test_the_log_says_that_init_reaches_nothing_but_gates_everything():
+    from kinetra.robot.motion_log import RETURN_CODE_NOTES
+    note = RETURN_CODE_NOTES["SportClient.Init"]
+    assert "3103" in note
+    assert "never reaches the robot" in note
+
+
+def test_a_command_that_raises_aborts_the_stage(tmp_path):
+    # A raised call records no return code, and `None` reads as "no code yet" to
+    # the abort monitor, so without an explicit check an exception on every tick
+    # would go unnoticed and the stage would run to completion looking fine.
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    code = main(["--stage", "yaw", "--dry-run", "--offline", "--out", str(tmp_path),
+                 "--warmup", "1.4", "--sim-move-raise"])
+    assert code == EXIT_ABORTED
+    payload = json.loads(next(tmp_path.glob("*_yaw/motion.json")).read_text())
+    abort = payload["result"]["abort"]
+    assert abort["predicate"] == "move_raised"
+    assert "injected failure" in abort["reason"]
+    # And it stopped on the first tick rather than grinding through the window.
+    assert payload["result"]["moves_written"] == 1
+
+
+def test_a_missing_return_code_alone_does_not_abort_the_monitor():
+    # Documents why the check above lives in the runner: `None` is also what the
+    # monitor sees before any call has been made, so it cannot mean failure.
+    from kinetra.robot.limits import AbortCriteria, AbortMonitor
+    monitor = AbortMonitor(make_state(), AbortCriteria())
+    assert monitor.observe(make_state(), 1000.0, Velocity(wz=0.3),
+                           return_code=None) is None
 
 
 def test_the_exit_codes_are_distinct():

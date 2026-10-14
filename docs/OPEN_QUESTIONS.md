@@ -29,63 +29,46 @@ RealSense capture were only exercised in `--dry-run` on a laptop. The first comm
 first real test, so it must be treated as a bring-up, not a routine step.
 *Closes with:* a single short move in a cleared area with a spotter, directions confirmed (+vx forward,
 +vy left, +wz left), and a measured stop distance.
-*Progress, October 14:* `kinetra.robot.motion_check` exists, with the `yaw` and `forward` stages built for
-this and 168 unit tests over the ceilings, the profile, the gate and the abort predicates. One **connected
-dry run** against the live robot confirmed the interface, the subscription, a 500 Hz state stream and a
-2688.88 s clock offset at 0.86 ms spread -- but it sent no command, because a dry run diverts `move` and
-`stop_move`. **No motion stage has been run, so this stays BLOCKING.** Note also that `+vy` is now refused
-outright, so only +vx and +wz will ever be confirmed.
+*Progress, October 14 -- the RPC path is verified; motion is not.* `kinetra.robot.motion_check` exists, with
+174 unit tests over the ceilings, the profile, the gate and the abort predicates.
 
-**1.3 Obstacle avoidance is switched on, but its main sensor is dead. [BLOCKING]**
-*Measured.* `/multiplestate` (1 Hz) reports `obstaclesAvoidSwitch: true`, while the L1 lidar produces no point
-clouds at all (§2.1). This is more dangerous than avoidance being off: the flag invites the belief that
-something is watching for obstacles when the sensor feeding it is silent. It is also unknown whether the
-feature gates `SportClient.Move` at all, or only the app's own joystick path.
-*Closes with:* deciding explicitly not to rely on it, and separately testing whether a commanded move toward a
-real obstacle is modified. Until then, assume **nothing** stops the robot but the operator.
+`--stage handshake` has now **run live against the robot**, and all three round-trips were answered by the
+robot with code 0:
 
-**1.4 Kinetra's motion limits are agreed and written down. [CLOSED October 14, 2026]**
-*Decided.* The approved set is in `docs/PROJECT_SPEC.md` ("Approved motion limits"), and
-`src/kinetra/robot/limits.py` is its executable copy: forward 0.15 m/s, reverse and lateral refused, yaw
-0.30 rad/s, a 2.0 s commanded window, 0.35 m commanded travel, 20 Hz, 0.30 s staleness, `StopMove()` as the
-terminal state. A value above a ceiling is refused rather than clamped, and `tests/test_limits.py` fails if
-the document and the code diverge. The bridge's defaults were not adopted.
+| call | code | what that establishes |
+| --- | --- | --- |
+| `SportClient.GetServerApiVersion` | 0 | the robot is reachable on `eno1`, *before* `Init()` and so independent of API registration |
+| `MotionSwitcherClient.CheckMode` | 0 | its motion mode is readable and reports normal sport mode |
+| `SportClient.StopMove` | 0 | the **registered** command path works: the robot received a command of ours and answered it |
 
-**1.5 `mode 7` in `/sportmodestate` is undecoded. [UNKNOWN]**
-*Measured but not interpreted.* Foot forces were 9–17 (essentially unloaded), so the robot was not standing on
-its feet. We cannot currently tell "standing and ready" from "lying down" or "damping" in a log.
-*Closes with:* reading the SDK's mode enumeration, or observing the field across known physical states.
-*Progress, October 14:* **there is no mode enumeration to read.** The whole of `unitree_sdk2py` and the
-`unitree_ros2` packages were searched; `_SportModeState_.py` declares the field and nothing assigns meaning
-to its values. So `mode` is now treated as permanently opaque: `limits.py` records it and never compares it
-to a literal, and the readiness gate decides from foot force, attitude, error code and freshness instead.
-`body_height` is excluded for the same reason -- it read 0.32 while the robot lay with unloaded feet.
-`--stage handshake`, run standing, will record the first standing signature and calibrate the foot-force
-threshold, which is currently an admitted guess.
+This is the first time any code in this project has commanded this robot, and it is the first evidence the
+`unitree_sdk2py` path works on this hardware at all -- the lab bridge's README says its SDK calls had only
+ever run in `--dry-run` on a laptop.
 
-**1.6 Arbitration with the robot's own controllers is unknown. [UNKNOWN]**
-*Measured.* `/api/sport/request` already has **12 publishers**, all internal Go2 services. Nothing is known
-about priority, last-writer-wins, or whether our commands can be overridden mid-move.
-*Closes with:* observing the topic while the robot is commanded, and reading the motion-switcher behaviour.
-*Progress, October 14:* the topic carries idle internal traffic even with nothing of ours running (api_id
-1034, polling `bodyHeight`/`footRaiseHeight`/`speedLevel`), and `/api/sport/response` carries a robot-side
-`status.code` keyed by `identity.id`. Since the SDK's `Move` is api_id 1008 on the same channel, watching
-both topics from a second terminal is the only independent confirmation that one of our commands reached the
-robot -- `Move`'s own return value cannot provide it (section 8). `motion_check` reads
-`MotionSwitcherClient.CheckMode()` in its handshake and deliberately never calls `SelectMode` or
-`ReleaseMode`.
+*Progress, October 14 -- the robot moves on our command.* Run `20261014T172046_078_yaw` sent the first
+velocity command in this project's history. The robot entered `mode 3` within 5 ms and began a trot, which
+`foot_force` shows unambiguously as alternating diagonal pairs. So `Move` reaches the robot and moves its
+legs.
 
-**1.7 No receiver-side watchdog is confirmed. [UNKNOWN]**
-*Untested.* The bridge stops on its own *sender* side when commands go stale. Whether anything on the **robot**
-stops if the Jetson process is killed mid-move, or the network drops, has not been shown.
-*Closes with:* killing the sender mid-move with a spotter present and measuring what happens.
-*Progress, October 14:* split into two stages, because most of this can be answered for free.
-`--stage watchdog-quiet` simply stops publishing while staying alive and fully able to `StopMove()`, which
-asks whether the robot stops when commands merely cease at **zero added risk**. Only then
-`--stage watchdog-kill` schedules its own `SIGKILL` mid-rotation; it yaws rather than walks so a persisting
-last command stays bounded in displacement, requires `--estop-evidence` from a `yaw-estop` run because
-nothing of ours survives the kill, and flushes its log every tick. Neither has been run. The self-kill and
-its partial log were verified against a simulated robot.
+*A bounded rotation has now been executed, October 14.* Run `20261014T174008_123_yaw` **completed**: 41
+ticks, no abort, stop confirmed. Results:
+
+| | |
+| --- | --- |
+| direction | `+wz` produced **+0.246 rad of positive yaw** -- counter-clockwise, i.e. left, as the lab bridge's docs claim. Confirmed on two runs. |
+| achieved vs commanded | 14.1° against 25.7° commanded, ratio 0.55, corroborated by the operator's ~15° eyeball (section 8.11) |
+| actuation latency | 23 ms from the first `Move` to observable motion (section 8.12) |
+| stop | `StopMove` acknowledged in 1.7 ms; motion continued **0.503 s**, settled 0.506 s after the last command |
+| stayed in place | net translation +0.013 m, though the path length was 0.132 m -- it wandered and came back |
+| body attitude | max tilt 0.029 rad throughout |
+
+**So the `+wz` half of this entry is closed.** The remaining criteria are `+vx` forward, which needs the
+`forward` stage, and a stop distance measured from *translation* rather than rotation. `+vy` is refused
+outright, so it will never be confirmed.
+
+One number worth carrying forward: the total foot force fell to **50** during the gait, well under the
+pre-arm gate of 90. The readiness gate is evaluated only before arming, which is correct -- a gate applied
+during locomotion would refuse a walking robot every cycle.
 
 ## 2. Sensing
 
@@ -314,14 +297,141 @@ than 0. The actual evidence is `motion_onset_s`.
 so an unreachable robot turns a sub-millisecond call into a timeout-long one — and a blocking round-trip
 costs up to twice its timeout. The command loop therefore uses 0.2 s, shutdown 0.5 s, handshake 1.0 s, and
 the watchdog runs in its own non-daemon thread so a loop stuck inside an SDK call cannot delay its own
-remedy. Per-call durations are recorded in every log; nobody has measured them on this hardware yet.
+remedy. Per-call durations are recorded in every log.
 
-**8.3 The foot-force gate is uncalibrated. [LIMIT]**
-*Measured, insufficiently.* The only `foot_force` ever read on this robot is the lying-down `[7, 14, 14, 7]`,
-and the units are unknown. The default threshold of 50 is an admitted guess recorded in every log. A standing
-`handshake` run writes a signature and the threshold becomes half the lightest standing foot; every motion
-stage refuses to run until that file exists.
-*Closes with:* a standing `handshake` run.
+*Measured October 14, 2026, by a connected dry run of the `yaw` stage* (run `20261014T170831_718_yaw`, with
+the real subscriber at 500 Hz and the real watchdog thread running, but `move`/`stop_move` diverted):
+
+| | |
+| --- | --- |
+| tick interval | median 50.11 ms against a 50.00 ms target, mean 50.27, max 54.63 |
+| jitter | stdev 0.72 ms, worst deviation 4.63 ms |
+| ticks over 55 ms | none, across 41 ticks |
+| window span | 2.011 s for a 2.0 s window |
+| state samples buffered | 3012 |
+
+So the loop holds its period comfortably on this Jetson at `MODE_30W`, and the worst observed deviation is
+~1% of the watchdog's 0.5 s stall threshold. **The per-call costs from that run are not the real ones** —
+they are the dry-run backend's 6-29 us, where a live `Move` adds an actual DDS write. The 50 ms budget has
+room for it, but the live figure is still unmeasured.
+
+**8.3 Foot force is the only usable standing signal, and it drifts. [LIMIT]**
+*Measured October 14, 2026.* Readings across the afternoon, with physical state known because the robot was
+stood and sat by hand with the remote:
+
+| state | lightest foot | total |
+| --- | --- | --- |
+| lying | 0–17 | 24–49 |
+| standing | 16–30 | 117–141 |
+
+**The standing reading decays, and a fresh stand does not reset it.** The lightest foot went 29, 30, 28, 25,
+22, 19, 16 and the total 141 down to 117 over roughly an hour, while `body_height` held at exactly 0.320
+throughout. Load that falls while the geometry does not move is not a stance change, so this is very probably
+foot-force **sensor drift**, plausibly thermal — the IMU read 79 °C at the survey. Re-standing was tried and
+the decay continued, which rules out stance relaxation.
+
+Consequences, and the current design:
+
+- **The lightest foot cannot tell the states apart.** Worst standing 16 against worst lying 17: they overlap.
+  So the per-foot floor is set to **8**, deliberately *below* every lying reading, and demoted to the only
+  job it can still do — catching a foot bearing nothing at all.
+- **The total still separates them cleanly**, 117 standing against 49 lying. It is therefore the whole
+  standing decision, floored at **90**: 1.8× above the worst lying reading, and leaving about 27 counts of
+  room for further drift.
+- Both floors are operator-overridable (`--min-foot-force`, `--min-foot-force-sum`) precisely because their
+  basis is known to move, and both are recorded in every log.
+
+Three earlier attempts at this threshold were wrong, and the sequence is worth remembering:
+
+- A guessed **50 per foot** refused a genuinely standing robot — standing forces here are far below a naive
+  weight-over-four-feet estimate.
+- **Half the lightest standing foot**, derived from a signature, gave 14 — *below* a lying reading, so it
+  would have passed a lying robot.
+- **Deriving a per-foot floor from a stance snapshot at all** was the wrong question: fitted to a good stance
+  it refuses an adequate one, and a lifted leg reads near zero whatever the stance.
+
+*Closes with:* understanding the drift. The proper fix is relative rather than absolute — compare a standing
+total against a lying baseline measured minutes earlier, since both drift together and the ~70–100 count
+*difference* is what actually carries the information. Deferred deliberately: the absolute floor of 90 is
+adequate for bring-up, and chasing the number further would narrow the band toward lying. **If a standing
+total below ~100 appears, fix the basis rather than lowering the floor again.**
+
+**8.9 `StopMove` returning 0 is an acknowledgement, not a stop. [LIMIT]**
+*Measured October 14, 2026* (run `20261014T172046_078_yaw`). `StopMove` returned code 0 in 1.4 ms, and the
+robot kept moving for a further **0.82 s**, peaking at 0.25 rad/s of body yaw after the stop had been
+acknowledged. At the forward stage's 0.15 m/s that is roughly 12 cm of travel past the point where the log
+says the robot was told to stop.
+
+Caveat on the number: the robot was mid-gait-cycle, so part of the 0.82 s is the trot finishing rather than
+deceleration. A second run measured **0.483 s** after `StopMove` (settle 0.485 s from the last command), from
+a longer 1.05 s of commanded rotation. So the figure varies with where in the gait cycle the stop lands, and
+both numbers are from interrupted runs rather than from steady motion. Treat 0.8 s as the planning figure
+until it is measured properly.
+
+Consequences: clearance for a motion stage must allow for post-stop travel rather than commanded travel, and
+no log should be read as "stopped at the time of the `StopMove` record". The `settle_time_s` and
+`stop_translation_m` fields exist for exactly this and are measured from the last command, not from the
+acknowledgement.
+
+**8.10 `error_code` is a status field, not only a fault field. [LIMIT]**
+*Measured over two runs, October 14, 2026.* `error_code` goes `0 -> 2` within 5 ms of the first `Move`,
+exactly as `mode` goes `1 -> 3` and the robot enters a trot, and it **stays at 2 for as long as the robot
+keeps walking** -- 829 consecutive samples with no break in run `20261014T173400_387_yaw` -- clearing about
+0.6 s after `StopMove`, once the robot settles. So `2` means "walking".
+
+Two wrong fixes were tried before that was understood, and the sequence is the useful part:
+
+- Aborting on **any change from baseline** fired 5 ms into the run, before the ramp reached a tenth of
+  target. No motion stage could complete.
+- Adding a **1.0 s dwell** looked right, because the first run showed `2` clearing at 0.656 s. But it had
+  cleared only because that run aborted at 0.052 s and the robot stopped. With the robot actually walking,
+  `2` persists for the whole stage, so the dwell merely moved the spurious abort to 1.0 s. Run
+  `20261014T173400_387_yaw` aborted that way after 22 ticks.
+
+Code `2` now never aborts, however long it persists; it is recorded in `notes.error_codes_seen` and listed in
+`BENIGN_ERROR_CODES`. An **undocumented** code still aborts on the dwell, which is the case the predicate
+exists for.
+
+*Residual:* `error_code` has no enumeration, so `2` is explained by correlation with `mode 3` alone. No code
+other than 0 and 2 has ever been observed on this robot.
+
+**8.11 The robot delivers about half the commanded rotation. [RISK]**
+*Measured twice, with an external check, October 14, 2026.*
+
+| run | ticks | commanded | achieved (odometry) | ratio |
+| --- | --- | --- | --- | --- |
+| `20261014T173400_387_yaw` | 23 | +0.248 rad (14.2°) | +0.129 rad (7.4°) | 0.52 |
+| `20261014T174008_123_yaw` | 41 | +0.449 rad (25.7°) | +0.246 rad (14.1°) | **0.55** |
+
+**The odometry is not the problem.** On the completed run the operator independently eyeballed **~15°**
+against the odometry's 14.1°, agreeing to within about 6%. So the shortfall is real tracking behaviour, not a
+measurement artefact -- which is what made this worth upgrading from a suspicion to a finding, and is why the
+external reading was asked for.
+
+Meanwhile the peak yaw *rate* **overshoots**: 0.370 rad/s against a commanded maximum of 0.30, in both runs.
+So the robot exceeds the commanded rate instantaneously while falling short of the commanded displacement,
+which is consistent with a trot whose body oscillates while its heading advances slowly.
+
+*Why it matters:* a planner that treats a commanded bounded action as the motion executed will be wrong by
+about a factor of two on rotation, and in the optimistic direction. A commanded rotation is a request.
+*Closes with:* repeating this across several runs and both signs, and establishing whether the ratio is
+stable enough to correct for, or whether rotation has to be closed-loop on measured yaw.
+
+**8.12 `Move(0, 0, 0)` is not a no-op: it starts the gait. [LIMIT]**
+*Measured October 14, 2026.* Tick 0 of every stage commands exactly zero, and the robot responds to it:
+`error_code` goes to 2 and `mode` to 3 within 5 ms, and observable motion begins **23 ms** after that zero
+command -- 27 ms *before* the first non-zero tick is even sent. So `Move` with any argument, including zero,
+puts the robot into velocity-tracking locomotion and it begins trotting in place.
+
+Two consequences:
+
+- **Motion onset must be timed from the first `Move` of any magnitude.** Timing it from the first non-zero
+  tick skipped the command the robot actually reacted to and reported ~1.4 ms, which is not a response
+  latency at all. Corrected, onset is **24.5, 22.7 and 22.9 ms** across the three runs -- consistent, and
+  the first real actuation latency measured on this robot.
+- **`Move(0,0,0)` is a poor stop on its own.** The stop sequence sends it before `StopMove()` for its
+  deterministic cost, but it sustains locomotion rather than ending it. `StopMove` is what leaves velocity
+  tracking, and it must always follow immediately.
 
 **8.4 `rclpy` and `unitree_sdk2py` cannot share a process. [LIMIT]**
 *Measured.* Both claim CycloneDDS domain 0 and the second `dds_create_domain` fails with

@@ -154,6 +154,7 @@ class MotionBackend(Protocol):
     """
 
     def server_api_version(self) -> tuple[int, str | None]: ...
+    def initialise(self) -> None: ...
     def check_mode(self) -> tuple[int, Any]: ...
     def move(self, velocity: Velocity) -> int: ...
     def stop_move(self) -> int: ...
@@ -186,13 +187,28 @@ class LiveBackend:
         self._switcher.Init()
         self._initialised = True
 
+    def _require_init(self) -> None:
+        """Fail here rather than letting the SDK answer 3103 forever.
+
+        `Init()` registers every api id; `__CheckApi` rejects an unregistered
+        one without touching the wire, so a loop that skipped it publishes
+        nothing at all while every call looks like an ordinary error code. This
+        turns that into one unambiguous failure before anything is attempted.
+        """
+        if not self._initialised:
+            raise RuntimeError(
+                "SportClient.Init() was not called, so no command can reach the robot: "
+                "every api id above 100 would be rejected locally with 3103")
+
     def check_mode(self) -> tuple[int, Any]:
         return self._switcher.CheckMode()
 
     def move(self, velocity: Velocity) -> int:
+        self._require_init()
         return self._sport.Move(velocity.vx, velocity.vy, velocity.wz)
 
     def stop_move(self) -> int:
+        self._require_init()
         return self._sport.StopMove()
 
     def set_timeout(self, timeout_s: float) -> None:
@@ -210,7 +226,8 @@ class DryRunBackend:
 
     def __init__(self, *, rpc_latency_s: float = 0.0, move_latency_s: float = 0.0,
                  move_code: int = 0, stop_code: int = 0, api_code: int = 0,
-                 mode_code: int = 0) -> None:
+                 mode_code: int = 0, move_raises: bool = False) -> None:
+        self._move_raises = move_raises
         self._latency = rpc_latency_s
         self._move_latency = move_latency_s
         self._move_code = move_code
@@ -218,6 +235,7 @@ class DryRunBackend:
         self._api_code = api_code
         self._mode_code = mode_code
         self.sent: list[Velocity] = []
+        self.initialised = False
 
     def _blocking(self) -> None:
         if self._latency > 0.0:
@@ -228,7 +246,7 @@ class DryRunBackend:
         return self._api_code, ("1.0.0.1" if self._api_code == 0 else None)
 
     def initialise(self) -> None:
-        return None
+        self.initialised = True
 
     def check_mode(self) -> tuple[int, Any]:
         self._blocking()
@@ -241,6 +259,8 @@ class DryRunBackend:
         # that here is what lets the loop-stall watchdog be tested at all.
         if self._move_latency > 0.0:
             time.sleep(self._move_latency)
+        if self._move_raises:
+            raise RuntimeError("injected failure inside Move")
         self.sent.append(velocity)
         return self._move_code
 
@@ -567,7 +587,11 @@ class StageRunner:
             problems.append(f"GetServerApiVersion returned {code}: the robot is not "
                             "reachable on this interface")
 
-        self.backend.initialise()
+        code, error, t0, t1 = _guarded("init", self.backend.initialise)
+        self._record("SportClient.Init", "handshake", None, code, error, t0, t1,
+                     blocking=True)
+        if error is not None:
+            problems.append(f"Init() raised: {error}")
 
         code, error, t0, t1 = _guarded("mode", self.backend.check_mode)
         self._record("MotionSwitcherClient.CheckMode", "handshake", None, code, error,
@@ -601,7 +625,31 @@ class StageRunner:
         if start_state is None:
             return EXIT_NO_DATA
 
-        abort = AbortMonitor(start_state, stage.abort)
+        criteria = stage.abort
+        if self.dry_run:
+            # `no_onset` asks whether the robot ignored a command we sent. In a
+            # dry run we send nothing, so "it did not move" is a tautology, not
+            # a finding, and leaving it armed would abort every dry run at 0.6 s
+            # and hide the loop timing the rest of the window would measure.
+            # Everything else stays armed: if the robot moves while we are
+            # sending nothing, that is very much worth knowing.
+            criteria = replace(criteria, disarmed=tuple(
+                set(criteria.disarmed) | {"no_onset"}))
+        abort = AbortMonitor(start_state, criteria)
+
+        # Register the API before anything is commanded. Owned by the runner so
+        # that both stage paths get it: it used to live only in `handshake()`
+        # and in main's dry-run branch, which meant a live motion stage ran
+        # with an unregistered client and published nothing at all.
+        code, error, t0, t1 = _guarded("init", self.backend.initialise)
+        self._record("SportClient.Init", "handshake", None, code, error, t0, t1,
+                     blocking=True)
+        if error is not None:
+            self.log.result = StageResult(
+                self._outcome("aborted"), commands_sent=len(self.log.commands),
+                abort=AbortVerdict(f"could not initialise the command path: {error}",
+                                   "init_failed"))
+            return EXIT_TRANSPORT
         window = stage.window_s
         deadline = time.monotonic() + window + DEADLINE_SLACK_S
         watchdog = Watchdog(self.monitor, abort, deadline)
@@ -673,8 +721,19 @@ class StageRunner:
                 self._record("SportClient.Move", "window", commanded, code, error, t0, t1,
                              blocking=False)
                 moves += 1
-                if first_command_monotonic is None and not commanded.is_stopped(
-                        limits.deadband):
+                if error is not None:
+                    # A raised call reports no code, and `None` reads as "no code
+                    # yet" to the abort monitor, so this is checked here instead.
+                    verdict = AbortVerdict(f"a command raised: {error}", "move_raised")
+                    break
+                if first_command_monotonic is None:
+                    # The FIRST Move of the stage, whatever its magnitude. A
+                    # Move(0,0,0) is not a no-op: measured 2026-10-14, it puts
+                    # the robot into locomotion and starts the gait 23 ms later,
+                    # 27 ms before the first non-zero tick. Timing onset from
+                    # the first non-zero command skipped the command the robot
+                    # actually reacted to and reported ~1.4 ms, which is not a
+                    # response latency at all.
                     first_command_monotonic = t0
                 if commanded.is_stopped(limits.deadband):
                     commanded_since = None
@@ -694,6 +753,18 @@ class StageRunner:
         finally:
             if not killed:
                 watchdog.close()
+
+        # A tolerated transient must still be visible: it aborted nothing, so
+        # the log is the only place it would ever show up.
+        self.log.notes["error_codes_seen"] = list(abort.error_codes_seen)
+        self.log.notes["error_code_baseline"] = abort.baseline_error_code
+        if abort.error_codes_seen:
+            self.log.notes["error_code_note"] = (
+                "codes differing from the baseline during the stage. They did not abort "
+                "it, so each is either explained (see BENIGN_ERROR_CODES in "
+                "kinetra.robot.limits) or cleared within the dwell window")
+            print(f"  error_code changed during the stage: "
+                  f"{list(abort.error_codes_seen)} (cleared, did not abort)")
 
         exit_code = self._finish(start_state, verdict, moves, first_command_monotonic)
         return exit_code
@@ -884,8 +955,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Move() ticks per second; Move is fire-and-forget and must be "
                         "re-issued every tick")
     p.add_argument("--min-foot-force", type=float, default=None,
-                   help="per-foot force required before motion; derived from the "
-                        "standing signature when one exists")
+                   help="per-foot force required before motion; catches a foot bearing "
+                        "nothing, and does not decide standing")
+    p.add_argument("--min-foot-force-sum", type=float, default=None,
+                   help="total foot force required before motion; this is what decides "
+                        "standing, and its basis is known to drift")
     p.add_argument("--warmup", type=float, default=2.0,
                    help="seconds of state collected before the briefing, so the clock "
                         "offset is measured (default: %(default)s)")
@@ -894,9 +968,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clearance", type=float, default=None,
                    help="measured clear distance ahead in m, required by --stage forward")
     p.add_argument("--tape-translation", type=float, default=None,
-                   help="tape-measured displacement in m, recorded as ground truth")
+                   help="optional: how far the robot actually moved in m, measured by "
+                        "you. The odometry is under test, so this is the ground truth")
     p.add_argument("--tape-rotation", type=float, default=None,
-                   help="tape/protractor-measured rotation in degrees")
+                   help="optional: how far the robot actually turned in degrees, "
+                        "measured by you against a floor mark; signed, left positive")
     p.add_argument("--direction", default="",
                    help='what you saw, e.g. "rotated left" -- recorded verbatim')
     p.add_argument("--allow-unready", action="store_true",
@@ -912,6 +988,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "watchdog (default: %(default)s)")
     p.add_argument("--sim-move-code", type=int, default=0,
                    help="return code for dry-run Move(), for fault injection")
+    p.add_argument("--sim-move-raise", action="store_true",
+                   help="make dry-run Move() raise, to exercise the abort path for a "
+                        "call that fails with no return code at all")
     p.add_argument("--sim-stop-code", type=int, default=0,
                    help="return code for dry-run StopMove(), for fault injection")
     return p
@@ -933,6 +1012,8 @@ def main(argv: list[str] | None = None) -> int:
         limits_kwargs["command_rate_hz"] = args.command_rate
     if args.min_foot_force is not None:
         limits_kwargs["min_foot_force"] = args.min_foot_force
+    if args.min_foot_force_sum is not None:
+        limits_kwargs["min_foot_force_sum"] = args.min_foot_force_sum
     try:
         limits = MotionLimits(**limits_kwargs)
     except ValueError as exc:
@@ -954,8 +1035,8 @@ def main(argv: list[str] | None = None) -> int:
     if stage.requires_signature and signature is None:
         blockers.append(
             f"no standing signature at {signature_path}. Run --stage handshake with the "
-            "robot standing first: the foot-force gate is otherwise a guess, and the "
-            "only value ever measured on this robot is the lying-down one")
+            "robot standing first: it records this robot's standing foot force and "
+            "calibrates the gate, so a motion stage never runs on an assumed stance")
     if stage.requires_estop_evidence:
         if not args.estop_evidence:
             blockers.append("--estop-evidence is required: nothing of ours survives "
@@ -977,11 +1058,14 @@ def main(argv: list[str] | None = None) -> int:
             blockers.append("--operator and --spotter are both required for a live "
                             "motion run")
 
-    if args.min_foot_force is None and signature is not None:
-        # Calibrated rather than guessed: half the lightest standing foot, which
-        # is far above the only lying-down reading and far below standing.
-        derived = max(1.0, float(signature["foot_force_min"]) * 0.5)
-        limits = replace(limits, min_foot_force=derived)
+    # The gate threshold is NOT derived from the signature. Two attempts at that
+    # were both wrong -- half the lightest standing foot lands below a lying
+    # reading, and 0.85 of a good stance refuses a merely adequate one -- and the
+    # mistake was conceptual: the per-foot floor exists to catch a lifted leg,
+    # which reads near zero whatever the stance, so fitting it to one snapshot
+    # was answering the wrong question. The thresholds are measured constants in
+    # `limits`, and the signature's job is to prove handshake was run standing
+    # and to record what standing looked like.
 
     schedule = build_schedule(stage, limits)
     bounds = schedule_bounds(stage, schedule, limits)
@@ -1068,9 +1152,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"clock: {monitor.clock.report()}")
         if state is not None:
             print(f"gate:  mode {state.mode}  error_code {state.error_code}  "
-                  f"foot_force {list(state.foot_force)}  "
+                  f"foot_force {list(state.foot_force)}  sum {sum(state.foot_force)}"
+                  f"/{limits.min_foot_force_sum:g}  "
                   f"loaded {state.loaded_feet(limits.min_foot_force)}/4  "
-                  f"threshold {limits.min_foot_force:g}")
+                  f"per-foot floor {limits.min_foot_force:g}")
         for reason in verdict.reasons:
             print(f"  not ready: {reason}", file=sys.stderr)
 
@@ -1095,7 +1180,8 @@ def main(argv: list[str] | None = None) -> int:
             backend: Any = DryRunBackend(rpc_latency_s=args.sim_rpc_latency,
                                          move_latency_s=args.sim_move_latency,
                                          move_code=args.sim_move_code,
-                                         stop_code=args.sim_stop_code)
+                                         stop_code=args.sim_stop_code,
+                                         move_raises=args.sim_move_raise)
         else:
             if not sys.stdin.isatty():
                 print("refused: a live run needs a typed confirmation on a terminal",
@@ -1113,8 +1199,6 @@ def main(argv: list[str] | None = None) -> int:
         runner = StageRunner(stage, limits, backend, monitor, log, dry_run=args.dry_run)
         runner.out_dir = out_root / log.run_id
 
-        if args.dry_run:
-            backend.initialise()
         print()
         if stage.sends_motion:
             exit_code = runner.run_motion()

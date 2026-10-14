@@ -118,6 +118,37 @@ sampled; a fallback or secondary view.
   `foot_raise_height 0.09`, IMU temperature 79 °C, rpy pitch −0.097 rad.
   `foot_force [9, 16, 17, 7]` — the legs were essentially unloaded, so the robot was not standing on its feet.
   Also carries `position`, `velocity`, `yaw_speed`, `foot_position_body`, `foot_speed_body`.
+
+### `mode` and `foot_force` across known physical states (measured October 14, 2026)
+
+Recorded while standing the robot up by hand with the remote, so the physical state is ground truth.
+
+| `mode` | `gait_type` | `foot_force` | total | physical state |
+| --- | --- | --- | --- | --- |
+| 7 | 0 | `[8, 13, 12, 8]` | 41 | lying down |
+| 7 | 1 | `[9, 16, 17, 7]` | 49 | lying down (October 7 survey) |
+| 6 | 0 | `[29, 34, 43, 30]` | 136 | standing, joints locked |
+| 1 | 0 | `[30, 37, 45, 28]` | 140 | standing, joints locked |
+| 3 | 0 | alternating diagonal pairs | — | **walking** (trot), entered on our first `Move` |
+
+`mode 3` was identified on October 14 by sending the first `Move` of the project: the robot went
+`1 → 3` within 5 ms and `foot_force` began alternating between diagonal pairs
+(`[18,36,44,19] → [30,10,12,37] → [0,46,65,0] → [60,60,68,74]`), which is a trot. So 3 is locomotion.
+
+**`mode` must not be used to tell standing from lying.** It read both 6 and 1 while the robot was physically
+standing still, changing between them with no command and no movement; a 5000-sample window read a steady
+`mode 1` while runs minutes either side read `mode 6`. There is no mode enumeration anywhere in
+`unitree_sdk2py` or the `unitree_ros2` packages, so these values have no documented meaning.
+`body_height` is equally useless for this: it reads 0.32 lying down.
+
+**`foot_force` is the only usable standing signal, and it drifts.** The *total* separates the states
+(24–49 lying against 117–141 standing); the *lightest foot* does not, because its standing range (16–30)
+overlaps its lying range (0–17). Worse, the standing reading **decays over about an hour and a fresh stand
+does not reset it**, while `body_height` holds at exactly 0.320 — so this is probably foot-force sensor
+drift rather than posture. `kinetra.robot.limits` therefore gates standing on the **total (≥ 90)** and uses a
+per-foot floor of **8** only to catch a foot bearing nothing. Units unknown. See
+`docs/OPEN_QUESTIONS.md` 8.3 for the margins, the drift evidence, and the three threshold mistakes made
+before the measurement existed.
 - `range_obstacle` in `/sportmodestate` read **[2.0, 2.0, 2.0, 2.0]** — saturated or placeholder. Do not treat it
   as a working proximity sensor until it has been seen to change with a real obstacle.
 - **Battery** (`/lowstate` → `bms_state`): **soc 46 %**, current −656 mA (discharging), cycle count 5,
@@ -204,8 +235,44 @@ Two corrections to the October 4 record: lateral is 0.05 m/s (not 0.2) and yaw i
 **These are still that project's settings, not approved Kinetra motion limits.**
 
 Critically, its own README states that the real `unitree_sdk2py` calls and the RealSense capture path were
-**never tested on hardware** — the only testing was in `--dry-run` on a laptop. So the SDK motion path on this
-robot is untested by anyone, and the first move will be its first real test.
+**never tested on hardware** — the only testing was in `--dry-run` on a laptop.
+
+**Update, October 14, 2026: the SDK RPC path now works on this robot.** `kinetra.robot.motion_check
+--stage handshake`, run live, had `GetServerApiVersion` (before `Init()`), `MotionSwitcherClient.CheckMode`
+and `SportClient.StopMove` all answered by the robot with code 0. That establishes reachability on `eno1`,
+API registration, and that the robot accepts and acknowledges a command from us.
+
+**Update, October 14: the robot physically responds to our velocity commands.** The first `Move` ever sent
+by this project (run `20261014T172046_078_yaw`) put the robot into `mode 3` within 5 ms and started a trot.
+So `Move` reaches the robot and moves its legs.
+
+Two things that first command measured, both of which matter more than the fact that it worked:
+
+- **`error_code` is not purely a fault field.** It went `0 → 2` in the same 5 ms, tracked gait mode exactly,
+  and **cleared itself at 0.656 s** once the robot settled. It flags the transition, not a failure.
+- **`StopMove` returning 0 is not the stop.** It was acknowledged in 1.4 ms, and the robot kept moving for a
+  further **0.82 s**. At the forward stage's 0.15 m/s that is ~12 cm of travel after the stop is
+  acknowledged. Part of that 0.82 s is the gait finishing its cycle, so a stop issued from steady motion
+  will differ.
+
+**Update, October 14: a bounded rotation has been executed.** Run `20261014T174008_123_yaw` completed its
+full 2 s window — 41 ticks, no abort, stop confirmed:
+
+| | |
+| --- | --- |
+| `+wz` direction | **left** (counter-clockwise); +0.246 rad of positive yaw. Confirmed on two runs |
+| achieved vs commanded | 14.1° of 25.7° commanded — **ratio 0.55**, corroborated by an operator eyeball of ~15° |
+| actuation latency | **23 ms** from the first `Move` to observable motion, consistent across three runs |
+| peak yaw rate | 0.370 rad/s against 0.30 commanded — it overshoots the rate while undershooting the displacement |
+| stop | acknowledged in 1.7 ms, motion continued **0.503 s** |
+| in-place quality | net translation +0.013 m, path length 0.132 m, max tilt 0.029 rad |
+
+Two behaviours worth knowing before writing any code that commands this robot:
+
+- **`Move(0, 0, 0)` is not a no-op.** It enters locomotion and starts the gait 23 ms later. `StopMove` is
+  what leaves velocity tracking.
+- **The commanded rotation is a request, not a displacement** — see `docs/OPEN_QUESTIONS.md` 8.11. Forward
+  translation has not been measured at all yet.
 
 Also unverified, and all of it gating any motion test:
 

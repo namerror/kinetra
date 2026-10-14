@@ -5,10 +5,11 @@ A **stage** is one bounded, pre-declared move, run on its own, with the operator
 sending it, and sends nothing without a typed confirmation. It is the first code in this repository that
 commands the robot.
 
-**Status: no motion stage has been run yet.** What has run is the dry-run path, including one connected dry
-run against the live robot (October 14, 2026) which confirmed the interface, the subscription, a 500 Hz state
-stream and a 2688.88 s clock offset with 0.86 ms spread. Everything below describing what the robot *does* is
-a question the stages exist to answer, not a result.
+**Status, October 14, 2026: `handshake` and `yaw` have run on hardware.** `yaw` completed its full window
+(`20261014T174008_123_yaw`): `+wz` is left, the robot delivers about 0.55 of the commanded rotation,
+actuation latency is 23 ms, and motion continues ~0.5 s after `StopMove` is acknowledged. `yaw-estop`,
+`forward`, `watchdog-quiet` and `watchdog-kill` have **not** been run, so anything below about those is a
+question the stage exists to answer rather than a result.
 
 ```
 src/kinetra/robot/
@@ -41,7 +42,7 @@ Three of these are not the obvious design, and the reasons matter.
 **`handshake` runs with the robot standing, and it is not motion-free.** `StopMove()` is a command, and what
 sport mode does with it on a lying robot in `mode 7` is unverified. Its real deliverable is the **first
 standing `foot_force` signature** ever measured on this robot, written to `<out>/standing-signature.json`;
-every motion stage refuses to run without it, because the gate threshold is otherwise a guess. It also calls
+every motion stage refuses to run without it, so a motion stage can never run on an assumed stance. It also calls
 `GetServerApiVersion()` **before** `Init()`: api id 1 is below `RPC_INTERNAL_API_ID_MAX`, so it bypasses the
 registration table, which separates "cannot reach the robot" from "did not register the API" into two
 findings instead of one ambiguous `3103`.
@@ -152,13 +153,18 @@ The project-wide register is [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md). These are t
 - **`motion_check.py` must never share a process with `rclpy`.** Both claim CycloneDDS domain 0, and the
   second `dds_create_domain` fails. This is why state comes from the SDK's `ChannelSubscriber` and not from
   ROS, and why `capture` and `motion_check` cannot be combined.
-- **The foot-force gate threshold is uncalibrated until `handshake` has run standing.** The only `foot_force`
-  ever measured on this robot is the lying-down `[7, 14, 14, 7]`, and the units are unknown. The default 50
-  is an admitted guess; once a signature exists the threshold becomes half the lightest standing foot, and
-  the value used is recorded in every log.
-- **`mode` and `body_height` are recorded and never asserted.** Both read the same while the robot was lying
-  down with unloaded feet, so neither discriminates standing. There is no sport-mode enumeration anywhere in
-  the SDK or the ROS packages.
+- **Standing is decided by the foot-force TOTAL, and that signal drifts.** Measured 2026-10-14: lying totals
+  24-49, standing 117-141, and the standing reading decays over an hour of use without a fresh stand
+  resetting it, while `body_height` does not move — so it is probably sensor drift, not posture. The gate is
+  therefore the **total (≥ 90)**, with a per-foot floor of **8** that only catches a foot bearing nothing;
+  the lightest foot is useless for standing-vs-lying, since worst standing (16) overlaps worst lying (17).
+  Both floors are overridable (`--min-foot-force`, `--min-foot-force-sum`) because their basis moves, and
+  both are logged. If a standing total under ~100 shows up, fix the basis rather than lowering the floor —
+  see `OPEN_QUESTIONS.md` 8.3 for the relative design that should replace it.
+- **`mode` and `body_height` are recorded and never asserted.** `body_height` read 0.32 while the robot lay
+  with unloaded feet. `mode` is worse than useless as a gate: it read 7 lying, and **both 6 and 1 while
+  physically standing**, changing between them without the robot moving. There is no sport-mode enumeration
+  anywhere in the SDK or the ROS packages.
 - **Integrated travel is an upper bound, not a prediction.** It assumes the robot tracks every command
   perfectly and instantly, which is what a travel cap wants and is not what will happen.
 - **Odometry is the thing under test, not the ruler.** `position` and `velocity` come from the same onboard
@@ -169,6 +175,20 @@ The project-wide register is [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md). These are t
   before writing, so an unreachable robot turns a sub-millisecond call into a timeout-long one. The command
   loop therefore runs at `SetTimeout` 0.2 s, and the watchdog lives in its own non-daemon thread so that a
   loop stuck inside an SDK call cannot delay its own remedy.
+- **`StopMove` returning 0 is an acknowledgement, not a stop.** Measured 2026-10-14: acknowledged in 1.4 ms,
+  and the robot kept moving for a further **0.82 s**. Clearance must allow for post-stop travel, and
+  `settle_time_s` / `stop_translation_m` are measured from the last command rather than from the
+  acknowledgement.
+- **`error_code` is a status field.** It goes `0 -> 2` on entering locomotion and stays there for as long as
+  the robot walks, clearing ~0.6 s after it settles. Code 2 therefore never aborts and is recorded in
+  `notes.error_codes_seen`; an undocumented code still aborts after a 1.0 s dwell.
+- **A commanded rotation is a request, not a displacement.** Measured twice: ratio 0.52 and 0.55, the second
+  corroborated by an operator's independent ~15 deg reading against the odometry's 14.1 deg. The peak yaw
+  rate meanwhile *overshoots* (0.370 against 0.30 rad/s commanded). Do not treat a bounded action as the
+  motion executed -- see `OPEN_QUESTIONS.md` 8.11.
+- **`Move(0, 0, 0)` is not a no-op**: it enters locomotion and starts the gait 23 ms later. `StopMove` is
+  what leaves velocity tracking, and it must always follow. Onset is therefore timed from the first `Move`
+  of any magnitude.
 - **Nothing stops this robot but the operator.** `obstaclesAvoidSwitch` reports `true` while the L1 lidar
   feeding it is dead, and `range_obstacle` reads a flat `2.0`. Neither is used as proximity data.
 - **`/tmp/cdds.LOG` cannot be disabled** when an interface is named: the SDK passes its own inline XML to
