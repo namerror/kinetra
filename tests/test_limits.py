@@ -109,7 +109,7 @@ def test_the_hard_ceilings_are_the_values_project_spec_records():
     # If this fails, PROJECT_SPEC.md and limits.py have diverged, and the
     # normative document no longer describes the code that enforces it.
     assert (HARD_MAX_FORWARD_MPS, HARD_MAX_YAW_RPS) == (0.15, 0.30)
-    assert (HARD_MAX_WINDOW_S, HARD_MAX_TRANSLATION_M) == (2.0, 0.35)
+    assert (HARD_MAX_WINDOW_S, HARD_MAX_TRANSLATION_M) == (6.0, 0.35)
 
 
 # -- clamping ---------------------------------------------------------------

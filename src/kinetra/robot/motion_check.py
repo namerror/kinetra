@@ -954,6 +954,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--command-rate", type=float, default=None,
                    help="Move() ticks per second; Move is fire-and-forget and must be "
                         "re-issued every tick")
+    p.add_argument("--window", type=float, default=None,
+                   help="override the stage's commanded window in seconds, both ramps "
+                        "included. Useful to give yourself more time to interrupt "
+                        "yaw-estop. The geometric caps are NOT relaxed with it, so a "
+                        "longer window is only accepted together with a slower "
+                        "--yaw-rate; the refusal says what it would have commanded")
+    p.add_argument("--yaw-rate", type=float, default=None,
+                   help="override the stage's commanded yaw rate in rad/s; only for a "
+                        "stage that already yaws, and never above the ceiling")
     p.add_argument("--min-foot-force", type=float, default=None,
                    help="per-foot force required before motion; catches a foot bearing "
                         "nothing, and does not decide standing")
@@ -996,6 +1005,42 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _apply_stage_overrides(stage: StageSpec, args: argparse.Namespace) -> StageSpec:
+    """Apply `--window` and `--yaw-rate` to the stage before anything is checked.
+
+    Deliberately NOT a way around the envelope. The overridden stage is the
+    stage from here on: `refusals` re-derives the commanded profile from it and
+    refuses the run if the longer window pushes commanded rotation or
+    translation past the caps, the briefing prints the real schedule, and
+    `stage.to_dict()` puts the override in the log. So the operator can trade
+    speed for time within a fixed geometric bound, and cannot buy more travel.
+    """
+    changes: dict[str, Any] = {}
+
+    if args.window is not None:
+        if not stage.sends_motion:
+            raise ValueError(f"--window does not apply to --stage {stage.name}: it "
+                             "commands no motion window")
+        if not math.isfinite(args.window) or args.window <= 0.0:
+            raise ValueError(f"--window must be positive, got {args.window!r}")
+        changes["window_s"] = args.window
+
+    if args.yaw_rate is not None:
+        if stage.target.wz == 0.0:
+            raise ValueError(f"--yaw-rate does not apply to --stage {stage.name}: its "
+                             "target does not yaw, and this is not the way to make it")
+        if not math.isfinite(args.yaw_rate) or args.yaw_rate == 0.0:
+            raise ValueError(f"--yaw-rate must be non-zero and finite, got "
+                             f"{args.yaw_rate!r}")
+        changes["target"] = replace(stage.target, wz=args.yaw_rate)
+
+    if not changes:
+        return stage
+    return replace(stage, notes=stage.notes + (
+        "OVERRIDDEN from the command line: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(changes.items())),), **changes)
+
+
 def _print_catalogue(limits: MotionLimits) -> None:
     for name in STAGE_NAMES:
         stage = STAGES[name]
@@ -1025,6 +1070,11 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     stage = STAGES[args.stage]
+    try:
+        stage = _apply_stage_overrides(stage, args)
+    except ValueError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
     out_root = Path(args.out)
     signature_path = (Path(args.signature) if args.signature
                       else out_root / DEFAULT_SIGNATURE_NAME)
@@ -1040,7 +1090,10 @@ def main(argv: list[str] | None = None) -> int:
     if stage.requires_estop_evidence:
         if not args.estop_evidence:
             blockers.append("--estop-evidence is required: nothing of ours survives "
-                            "SIGKILL, so the remote must already be known to stop us")
+                            "SIGKILL, so the remote must already be known to override "
+                            "us. Note what a yaw-estop run can prove -- the override "
+                            "holds only while the stick is held (OPEN_QUESTIONS 8.13), "
+                            "so do not release it during this stage")
         else:
             try:
                 evidence = load_motion_log(args.estop_evidence)

@@ -1,6 +1,6 @@
 # Open questions, limitations, and missing information
 
-**Last updated: October 7, 2026.** This is the authoritative register of what Kinetra does *not* know or
+**Last updated: October 15, 2026.** This is the authoritative register of what Kinetra does *not* know or
 cannot yet do. `docs/ROBOT_INVENTORY.md` records what was measured; this file records what is missing, why it
 matters, and what would close it.
 
@@ -14,14 +14,33 @@ without a live check — a catalogue entry, a model card, or a config flag is no
 
 ## 1. Before the robot moves at all
 
-**1.1 No operator emergency stop has been demonstrated. [BLOCKING]**
-*Untested.* The pre-existing bridge's documentation says the Unitree handheld remote overrides the SDK, but
-nobody has shown that on this robot. `/wirelesscontroller` at least makes remote input observable.
-*Closes with:* a spotter holding the remote, interrupting a commanded move, and the stop being measured.
-*Progress, October 14:* `kinetra.robot.motion_check --stage yaw-estop` is built for exactly this and
-disarms the predicates that would otherwise make *us* stop the robot during the interrupt -- armed, they fire
-the moment the remote takes over and the run can no longer distinguish "the remote stopped it" from "we
-stopped ourselves". The stage has not been run.
+**1.1 The handheld remote overrides us, but no *latching* emergency stop exists. [RISK]**
+*Measured October 15, 2026 -- half closed, and the open half is the more important one.* The pre-existing
+bridge's documentation said the Unitree handheld remote overrides the SDK. It does. What it does not do is
+stay overridden.
+
+`kinetra.robot.motion_check --stage yaw-estop` was built for exactly this and disarms the predicates that
+would otherwise make *us* stop the robot during the interrupt -- armed, they fire the moment the remote takes
+over and the run can no longer distinguish "the remote stopped it" from "we stopped ourselves". Four live runs
+on October 15, operator Leon, each commanding `+0.12 rad/s` for a 5.0 s window while 100 `Move` writes
+continued through the interrupt:
+
+| run | what the operator did | what the robot did |
+| --- | --- | --- |
+| `20261015T193404_875` | held the remote for the whole window | our stream produced **nothing**: peak yaw 0.022 rad/s, net rotation -0.006 rad |
+| `20261015T193551_446` | three short interrupts inside the window | overrode us each time (peak -0.86 rad/s), and our rotation **resumed between them** |
+| `20261015T193458_605` | interrupted at the end of the window | overrode us at -1.16 rad/s, 3.9x our own yaw ceiling |
+| `20261015T193521_364` | drove the robot forward instead of stopping it | 0.632 m/s, and **our translation cap aborted the run** at 0.149 m |
+
+**So the override is real and total while the stick is held.** It is not a blend and not a sum: in
+`193404_875` the robot answered 5.0 s of our commands with 0.022 rad/s of yaw, which is indistinguishable
+from standing still.
+
+**And it is transient.** The moment the operator lets go, our `Move` stream has the robot again, within the
+same window -- see §8.13. That makes the remote a priority override, not an emergency stop: it suppresses a
+runaway command stream only for as long as a human keeps holding it.
+*Still closes with:* a stop that **latches** -- after which no command of ours moves the robot until a human
+clears it. Nothing on this robot has been shown to do that yet, and §8.13 is the entry that tracks it.
 
 **1.2 The motion path has never run on hardware — by anyone. [BLOCKING]**
 *Untested.* `/home/jetson/repos/robot_control`'s own README states the real `unitree_sdk2py` calls and the
@@ -278,7 +297,8 @@ the final days.
    software plus a stationary robot, and it is the premise everything else rests on.
 2. **§2.1 lidar triage, time-boxed to an hour**, then a written decision either way.
 3. **§2.2 camera transform** — a tape measure and a static transform publisher.
-4. **§1.1–1.4 safety** — before any autonomy, in a cleared area with a spotter.
+4. **§1.1 + §8.13 safety** — the remote override is demonstrated; what is missing is a stop that *latches*.
+   Establish whether this robot has one before any autonomy, in a cleared area with a spotter.
 
 ## 8. Bounded motion — known limits
 
@@ -432,6 +452,57 @@ Two consequences:
 - **`Move(0,0,0)` is a poor stop on its own.** The stop sequence sends it before `StopMove()` for its
   deterministic cost, but it sustains locomotion rather than ending it. `StopMove` is what leaves velocity
   tracking, and it must always follow immediately.
+
+**8.13 The handheld remote is a transient override, not a latching stop. [RISK]**
+*Measured October 15, 2026, across four `yaw-estop` runs.* The remote outranks a live commanding process
+completely while the stick is held (§1.1). When it is released, **our command stream gets the robot back**,
+inside the same window, with no action on our part.
+
+`20261015T193551_446` shows it directly, at 500 Hz. Commanded `+0.12 rad/s` throughout; the operator
+interrupted three times:
+
+| t+ | measured yaw | whose command |
+| --- | --- | --- |
+| 1.30 - 1.60 s | down to **-0.86 rad/s** | the remote, against our commanded direction |
+| 1.60 - 3.76 s | back to **+0.05 ... +0.06 rad/s** | **ours, resumed** |
+| 3.76 - 3.87 s | -0.72 rad/s | the remote |
+| 3.87 - 5.02 s | **+0.05 rad/s** | **ours, resumed again** |
+
+The resumed rate is about half the commanded 0.12 rad/s, which is §8.11's 0.55 tracking ratio and not a
+partial override: it is the robot doing what it normally does with our commands.
+
+*Why it matters, and it matters more than the override itself:* an operator interrupt is **not** a way to end
+a bad command stream. It pauses one. If the supervisor is wedged in a loop that keeps publishing `Move`, the
+spotter can hold the robot still indefinitely but cannot make it stop and stay stopped -- releasing the stick
+resumes the motion they just interrupted. Two consequences we are now committed to:
+
+- **Our own stop path is the stop path.** `StopMove` from our process, the abort predicates, and the geometric
+  caps are what actually end a run. The remote is a hold, bought with a human's continuous attention.
+- **An operator who interrupts must not release until the robot is confirmed stopped,** and should sit it
+  down with the remote rather than let go of it. `watchdog-kill`'s operator actions now say this explicitly,
+  because after `SIGKILL` we send no further `Move` -- but if the robot holds the last one (§8.9, still open),
+  release could hand control back to a command nobody is left to retract.
+
+*Closes with:* finding out whether anything on this robot latches -- the remote's own stop/damp button as
+distinct from a stick input, `Damp()`, or a mode switch -- and if nothing does, saying so in
+`PROJECT_SPEC.md` as an accepted limit of the demo rather than leaving it implied.
+
+**8.14 The geometric travel cap is what caught an operator-driven move. [LIMIT]**
+*Measured October 15, 2026, run `20261015T193521_364`.* The operator used the remote to drive the robot
+**forward** during an in-place yaw instead of stopping it. Measured speed reached **0.632 m/s**, 4.2x our own
+forward ceiling, and the run **aborted** at a measured 0.149 m against the stage's 0.150 m translation cap,
+after 90 of 100 planned `Move` writes.
+
+Note what did the catching. `yaw-estop` deliberately disarms `no_onset`, `overspeed`, `operator_interrupt`
+and `feet_unloaded`, so the only armed predicate able to see this was the **translation cap, checked against
+measured odometry** -- which is exactly the case §8.5 and the `limits` docstring claim it exists for: a bound
+that trusts no clock, no loop rate and no velocity command. It fired on its first real opportunity.
+
+The converse is the uncomfortable half, and it is the same finding from the other side: an operator who uses
+the remote to hold the robot **still** trips nothing at all. `193404_875` held it still for a whole window and
+the run reported `completed`, because standing still violates no geometric cap and `no_onset` is disarmed here
+on purpose. A run that completes is therefore not evidence that the robot executed what we commanded, and
+`motion_onset_s` (5.609 s, i.e. past the window) is the field that gives it away.
 
 **8.4 `rclpy` and `unitree_sdk2py` cannot share a process. [LIMIT]**
 *Measured.* Both claim CycloneDDS domain 0 and the second `dds_create_domain` fails with

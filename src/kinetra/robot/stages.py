@@ -106,6 +106,15 @@ class ScheduledCommand:
 
 _YAW_TARGET = Velocity(wz=0.30)
 _FORWARD_TARGET = Velocity(vx=0.15)
+# yaw-estop rotates SLOWER than `yaw`, and for longer. The rotation cap is the
+# binding constraint -- 0.70 rad of commanded rotation, whatever the rate -- so
+# buying the operator time to reach the remote means spending that same
+# rotation more slowly. 0.12 rad/s over a 5.0 s window commands 0.576 rad and
+# leaves 4.8 s of steady rotation to interrupt, against 1.5 s at 0.30 rad/s.
+# It stays well above ONSET_YAW_RPS (0.05 rad/s), so motion onset is still
+# measurable, and ~6.9 deg/s is still plainly visible to a spotter.
+_ESTOP_YAW_TARGET = Velocity(wz=0.12)
+_ESTOP_WINDOW_S = 5.0
 
 # Geometric caps per stage, tighter than the global ceilings where the stage's
 # own geometry allows it. An in-place yaw that translates 0.15 m has drifted off
@@ -159,13 +168,15 @@ STAGES: dict[str, StageSpec] = {
     ),
     "yaw-estop": StageSpec(
         name="yaw-estop",
-        summary="rotate in place while the operator interrupts with the remote",
-        target=_YAW_TARGET,
-        window_s=2.0,
+        summary="rotate in place slowly for 5.0 s while the operator interrupts "
+                "with the remote",
+        target=_ESTOP_YAW_TARGET,
+        window_s=_ESTOP_WINDOW_S,
         sends_motion=True,
         blocking_calls=("SportClient.StopMove",),
-        expectation="the remote overrides a live commanding process; the robot stops "
-                    "while we are still publishing Move",
+        expectation="MEASURED 2026-10-15: the remote overrides a live commanding "
+                    "process totally while the stick is held, and our Move stream "
+                    "resumes the moment it is released. Re-run to test the release.",
         # operator_interrupt, no_onset and overspeed are DISARMED here on purpose.
         # Armed, they would fire the instant the remote took over and we would stop
         # the robot ourselves -- after which we could never distinguish "the remote
@@ -175,8 +186,11 @@ STAGES: dict[str, StageSpec] = {
                                       "feet_unloaded")),
         clearance_note="1.5 m clear radius, operator within arm's reach of the robot",
         operator_actions=(
-            "interrupt with the handheld remote about halfway through the rotation",
+            "interrupt with the handheld remote about halfway through the rotation "
+            "-- the window is 5.0 s, so there is no hurry",
             "then report what the robot did, and whether it resumed when you let go",
+            "KEEP HOLDING until the robot is stopped, and sit it down with the remote: "
+            "letting go has been measured to hand the robot back to our Move stream",
         ),
         requires_signature=True,
         post_log_s=ESTOP_POST_LOG_S,
@@ -184,9 +198,17 @@ STAGES: dict[str, StageSpec] = {
             "We keep publishing Move through the interrupt until the window ends. "
             "That is the actual question: whether the remote outranks a live "
             "commanding process, not whether it outranks silence.",
+            "Slower and longer than `yaw` on purpose: 0.12 rad/s over 5.0 s instead "
+            "of 0.30 rad/s over 2.0 s. Same bounded rotation, but 4.8 s of steady "
+            "motion to interrupt rather than 1.5 s. An interrupt test the operator "
+            "cannot comfortably interrupt measures the operator, not the robot.",
             "State is logged for 3 s afterwards because the robot RESUMING our Move "
             "stream when the stick is released is a distinct outcome that matters.",
             "This run's log is the evidence watchdog-kill requires.",
+            "MEASURED 2026-10-15 (OPEN_QUESTIONS 8.13): the override is real but does "
+            "NOT latch -- our rotation resumed between interrupts in the same window. "
+            "A run that reports `completed` is also not evidence the robot moved: an "
+            "operator holding it still trips nothing here, so read motion_onset_s.",
         ),
     ),
     "forward": StageSpec(
@@ -241,6 +263,10 @@ STAGES: dict[str, StageSpec] = {
         operator_actions=(
             "hold the remote with your thumb on the stop for the whole run",
             "stop the robot yourself if it is still rotating a second after the kill",
+            "do NOT let go once you have interrupted: the remote has been measured to "
+            "override a command stream only while held (OPEN_QUESTIONS 8.13), and if "
+            "the robot holds our last Move there is no process left to retract it. "
+            "Sit it down with the remote before releasing.",
         ),
         requires_signature=True,
         requires_estop_evidence=True,

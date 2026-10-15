@@ -11,7 +11,14 @@ import sys
 
 import pytest
 
-from kinetra.robot.limits import HARD_MAX_TRANSLATION_M, MotionLimits, Velocity
+from kinetra.robot.limits import (
+    HARD_MAX_ROTATION_RAD,
+    HARD_MAX_TRANSLATION_M,
+    ONSET_YAW_RPS,
+    MotionLimits,
+    Velocity,
+    ramp_duration_s,
+)
 from kinetra.robot.stages import (
     STAGE_NAMES,
     STAGES,
@@ -112,6 +119,56 @@ def test_the_estop_stage_disarms_the_predicates_that_would_stop_the_robot_for_us
 
 def test_the_estop_stage_keeps_logging_long_enough_to_see_the_robot_resume():
     assert STAGES["yaw-estop"].post_log_s >= 3.0
+
+
+def test_the_estop_stage_rotates_long_enough_to_actually_be_interrupted():
+    # The operator has to see the rotation, reach for the remote and interrupt
+    # it, which a 2.0 s window at 0.30 rad/s does not leave room for: it holds
+    # a steady rate for about 1.5 s. The stage is slower and longer instead.
+    stage = STAGES["yaw-estop"]
+    limits = MotionLimits()
+    ramp = ramp_duration_s(stage.target, stage.window_s, limits)
+    steady_s = stage.window_s - 2.0 * ramp
+    assert stage.window_s >= 4.0
+    assert steady_s >= 3.0
+    assert abs(stage.target.wz) < abs(STAGES["yaw"].target.wz)
+    # Still unambiguously moving, not creeping below the onset threshold.
+    assert abs(stage.target.wz) >= 2.0 * ONSET_YAW_RPS
+
+
+def test_the_longer_estop_window_buys_no_extra_rotation():
+    # The whole safety case for the longer window: the geometric cap is
+    # unchanged, so the time is bought by going slower, not by travelling more.
+    limits = MotionLimits()
+    estop = STAGES["yaw-estop"]
+    yaw = STAGES["yaw"]
+    bounds = schedule_bounds(estop, build_schedule(estop, limits), limits)
+    yaw_bounds = schedule_bounds(yaw, build_schedule(yaw, limits), limits)
+    assert bounds["commanded_rotation_rad"] <= yaw_bounds["rotation_cap_rad"]
+    assert bounds["commanded_rotation_rad"] <= HARD_MAX_ROTATION_RAD
+    assert bounds["commanded_translation_m"] == 0.0
+    assert refusals(estop, limits) == ()
+
+
+def test_a_long_window_at_the_full_yaw_rate_is_refused():
+    # The window ceiling allows 6.0 s; the rotation cap is what stops a 6.0 s
+    # run at 0.30 rad/s, and it must still be the thing that bites.
+    limits = MotionLimits()
+    greedy = type(STAGES["yaw-estop"])(**{**STAGES["yaw-estop"].__dict__,
+                                          "target": Velocity(wz=0.30),
+                                          "window_s": 6.0})
+    reasons = refusals(greedy, limits)
+    assert any("rotation" in r for r in reasons), reasons
+
+
+def test_the_interrupt_stages_tell_the_operator_not_to_let_go():
+    # Measured 2026-10-15 (OPEN_QUESTIONS 8.13): the remote overrides a live
+    # command stream only while it is held, and releasing it hands the robot
+    # back. An operator briefing that omits this is actively misleading.
+    for name in ("yaw-estop", "watchdog-kill"):
+        actions = " ".join(STAGES[name].operator_actions).lower()
+        assert "let go" in actions or "releasing" in actions, name
+        assert "sit it down" in actions, name
 
 
 def test_the_quiet_watchdog_stage_stops_publishing_inside_its_window():

@@ -50,7 +50,20 @@ HARD_MAX_LATERAL_MPS = 0.0
 # ~17 deg/s: a body turn a spotter sees clearly inside a second.
 HARD_MAX_YAW_RPS = 0.30
 # Total commanded window, both ramps included -- not just the hold.
-HARD_MAX_WINDOW_S = 2.0
+#
+# Raised from 2.0 s on 2026-10-15 so an operator-interrupt stage can run long
+# enough to be interrupted: at 0.30 rad/s a 2.0 s window leaves under 1.5 s of
+# steady rotation, which is not enough time to reach for the remote and see
+# what happened. Note what this ceiling does and does not bound: the window is
+# a CLOCK bound and bounds nothing physical on its own. What the robot may
+# actually travel is bounded by HARD_MAX_TRANSLATION_M and
+# HARD_MAX_ROTATION_RAD below, which are unchanged, are checked against
+# measured odometry rather than against the profile, and are checked against
+# the commanded profile again in `stages.refusals` before anything is sent. So
+# a longer window is only reachable by commanding a SLOWER motion, which is
+# exactly the trade an interrupt stage wants. A 6.0 s window at the full
+# 0.30 rad/s yaw would command 1.74 rad and is refused.
+HARD_MAX_WINDOW_S = 6.0
 
 # Geometric bounds, checked against measured odometry rather than against the
 # profile. They trust no clock, no loop rate and no velocity command, which is

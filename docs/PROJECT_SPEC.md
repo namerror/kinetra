@@ -44,7 +44,7 @@ not the pre-existing lab bridge's defaults, which are another project's settings
 | Backward speed | **refused** |
 | Lateral speed | **refused** |
 | Yaw rate | 0.30 rad/s |
-| Commanded window per action | 2.0 s, both acceleration ramps included |
+| Commanded window per action | 6.0 s, both acceleration ramps included |
 | Commanded travel per action | 0.35 m |
 | Commanded rotation per action | 0.70 rad |
 | Acceleration | 0.3 m/s², 0.6 rad/s² |
@@ -59,6 +59,14 @@ Either gets its own bring-up stage, with its own spotter, if it is ever actually
 
 A requested value above a ceiling is **refused, not clamped**: clamping would let an operator ask for
 0.4 m/s, receive 0.15, and read a success message.
+
+The window ceiling is the one limit that bounds nothing physical by itself — it is a clock bound. What the
+robot may actually do is bounded by the travel and rotation limits, which are checked against the commanded
+profile before a run and against measured odometry during it. That is why the window may be lengthened from
+the command line (`--window`, with `--yaw-rate`) while the travel and rotation limits may not: a longer
+window is only reachable by commanding a slower motion, which is the trade the `yaw-estop` stage wants, since
+an interrupt test the operator cannot comfortably interrupt measures the operator rather than the robot. At
+the full 0.30 rad/s yaw rate the rotation limit still caps a run at about 2.3 s.
 
 ### Operator contract for a physical trial
 

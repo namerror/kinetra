@@ -32,7 +32,7 @@ Run them in this order. Each refuses to run until its prerequisite exists, in co
 | --- | --- | --- |
 | `handshake` | no motion; three round-trips | Is the command path real? What does this robot look like standing? |
 | `yaw` | `+0.30 rad/s`, 2.0 s window, ~26° | Is `+wz` left? What is the stop distance? |
-| `yaw-estop` | the same, through an operator interrupt | Does the remote override a *live commanding process*? |
+| `yaw-estop` | `+0.12 rad/s`, 5.0 s window, ~33°, through an operator interrupt | Does the remote override a *live commanding process*? |
 | `forward` | `0.15 m/s`, 2.0 s window, ~0.22 m | Does it walk and stop where we think? |
 | `watchdog-quiet` | stops publishing mid-rotation | Does the robot stop when commands merely cease? |
 | `watchdog-kill` | SIGKILLs itself mid-rotation | Does anything robot-side stop a move when we die? |
@@ -53,6 +53,37 @@ then unable to distinguish "the remote stopped it" from "we stopped ourselves" �
 question. So this stage keeps publishing `Move` through the interrupt until the window ends, and keeps
 logging for 3 s afterwards, because the robot **resuming** our command stream when the stick is released is a
 distinct and important outcome.
+
+It also rotates **slower and longer than `yaw`** — `0.12 rad/s` over `5.0 s`, against `0.30 rad/s` over
+`2.0 s`. The binding constraint is the 0.70 rad rotation cap, not the clock, so the same bounded rotation
+spent more slowly buys 4.8 s of steady motion to interrupt instead of 1.5 s, and an interrupt test the
+operator cannot comfortably interrupt measures the operator rather than the robot. Either number can be
+changed for one run with `--window` and `--yaw-rate`; the caps are not relaxed with them, so asking for a
+longer window at an unchanged rate is refused before anything is sent:
+
+```
+python3 -m kinetra.robot.motion_check --stage yaw-estop --window 5.5 --yaw-rate 0.11 \
+    --operator you --spotter them --dry-run
+```
+
+### What `yaw-estop` found, October 15, 2026
+
+Four live runs, operator Leon. Both halves of the result matter, and the second half was the surprise:
+
+- **The remote overrides a live commanding process, totally.** While the stick is held, our `Move` stream
+  produces nothing. One run answered a full 5.0 s of commanded rotation with 0.022 rad/s of measured yaw.
+- **The override does not latch.** Release the stick and our stream has the robot back inside the same
+  window, at the usual ~0.5 of the commanded rate. So an interrupt is a *hold*, not a stop, and it costs a
+  human's continuous attention for as long as it lasts (`OPEN_QUESTIONS.md` 8.13).
+- **Driving the robot away instead of stopping it aborts the run.** One run was pushed forward at 0.632 m/s
+  and the translation cap fired at 0.149 m of the 0.150 m allowance — measured odometry catching what no
+  command-side check could, since this stage disarms `overspeed` and `operator_interrupt` on purpose
+  (`OPEN_QUESTIONS.md` 8.14).
+- **Holding the robot still aborts nothing**, and the run reports `completed`. Read `motion_onset_s` before
+  believing a completed run moved: on that run it was 5.609 s, past the end of the window.
+
+The operator consequence: **if you interrupt, keep holding and sit the robot down with the remote.** Letting
+go hands the robot back to whatever was commanding it.
 
 **`watchdog-quiet` comes before `watchdog-kill`.** Simply ceasing to publish, while staying alive and fully
 able to `StopMove()`, answers most of the receiver-watchdog question at **zero added risk**. If the robot

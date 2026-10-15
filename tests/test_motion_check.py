@@ -115,6 +115,53 @@ def test_the_kill_stage_is_refused_without_evidence_the_remote_can_stop_us(tmp_p
     assert "--estop-evidence is required" in capsys.readouterr().err
 
 
+def test_the_window_can_be_lengthened_from_the_command_line(tmp_path, capsys):
+    # The reason the flag exists: an operator needs time to reach the remote.
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    assert main(["--stage", "yaw-estop", "--dry-run", "--offline", "--sim-motion",
+                 "--out", str(tmp_path), "--window", "5.5",
+                 "--yaw-rate", "0.10"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "wz +0.10" in out
+    payload = json.loads(next(tmp_path.glob("*_yaw-estop/motion.json")).read_text())
+    assert payload["stage"]["window_s"] == 5.5
+    assert payload["stage"]["target"]["wz"] == 0.10
+    assert any("OVERRIDDEN" in note for note in payload["stage"]["notes"])
+
+
+def test_a_longer_window_at_the_full_rate_is_refused_not_quietly_shortened(tmp_path,
+                                                                           capsys):
+    # The flag buys time, never travel: the rotation cap still decides, so a
+    # long window is only reachable at a rate low enough to fit inside it.
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    assert main(["--stage", "yaw-estop", "--dry-run", "--offline",
+                 "--out", str(tmp_path), "--window", "5.5",
+                 "--yaw-rate", "0.30"]) == EXIT_REFUSED
+    assert "rotation" in capsys.readouterr().err
+
+
+def test_the_window_ceiling_still_refuses_a_window_nobody_is_watching(tmp_path, capsys):
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    assert main(["--stage", "yaw-estop", "--dry-run", "--offline",
+                 "--out", str(tmp_path), "--window", "60",
+                 "--yaw-rate", "0.01"]) == EXIT_REFUSED
+    assert "exceeds the ceiling" in capsys.readouterr().err
+
+
+def test_the_yaw_rate_flag_cannot_raise_the_yaw_ceiling(tmp_path, capsys):
+    write_signature(tmp_path / "standing-signature.json", make_state(), {})
+    assert main(["--stage", "yaw-estop", "--dry-run", "--offline",
+                 "--out", str(tmp_path), "--yaw-rate", "0.9"]) == EXIT_REFUSED
+    assert "envelope" in capsys.readouterr().err
+
+
+def test_the_overrides_do_not_apply_to_a_stage_they_make_no_sense_for(capsys):
+    assert main(["--stage", "handshake", "--window", "5.0"]) == EXIT_REFUSED
+    assert "--window does not apply" in capsys.readouterr().err
+    assert main(["--stage", "forward", "--yaw-rate", "0.2"]) == EXIT_REFUSED
+    assert "--yaw-rate does not apply" in capsys.readouterr().err
+
+
 def test_a_refused_run_is_still_written_to_disk(tmp_path):
     # A refusal is evidence and belongs on disk like any other outcome.
     main(["--stage", "yaw", "--dry-run", "--offline", "--out", str(tmp_path)])
